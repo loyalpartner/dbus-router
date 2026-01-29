@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/loyalpartner/dbus-router/compare/v0.4.1...v0.4.2) (2026-01-29)
+
+
+### Bug Fixes
+
+* correctly skip unhandled header fields in parse_header_fields ([b2ad1a8](https://github.com/loyalpartner/dbus-router/commit/b2ad1a8dc22b5df09c034951fedb39f7d7f2fd5c))
+
 ## [0.4.1](https://github.com/loyalpartner/dbus-router/compare/v0.4.0...v0.4.1) (2026-01-29)
 
 
