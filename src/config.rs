@@ -1,6 +1,7 @@
 //! Configuration file parsing for routing rules
 
 use anyhow::Result;
+use glob::Pattern;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -49,8 +50,17 @@ impl Config {
     }
 
     /// Check if a process is allowed to register services on the host bus.
+    ///
+    /// Supports glob pattern matching (e.g., "*/python3*", "/usr/bin/python*").
     pub fn has_hostpass(&self, exe_path: &Path) -> bool {
-        self.hostpass.iter().any(|h| h.process == exe_path)
+        let exe_str = exe_path.to_string_lossy();
+        self.hostpass.iter().any(|h| {
+            let pattern_str = h.process.to_string_lossy();
+            match Pattern::new(&pattern_str) {
+                Ok(pattern) => pattern.matches(&exe_str),
+                Err(_) => false,
+            }
+        })
     }
 }
 
@@ -145,23 +155,30 @@ destination = "org.freedesktop.portal.*"
     }
 
     #[test]
-    fn test_has_hostpass() {
+    fn test_has_hostpass_glob_pattern() {
         let config = Config {
             host_routes: vec![],
             hostpass: vec![
                 HostPass {
-                    process: PathBuf::from("/usr/bin/my-sandbox-app"),
+                    process: PathBuf::from("*/python3*"),
                 },
                 HostPass {
-                    process: PathBuf::from("/opt/app/bin/service"),
+                    process: PathBuf::from("/usr/bin/node"),
                 },
             ],
         };
 
-        assert!(config.has_hostpass(Path::new("/usr/bin/my-sandbox-app")));
-        assert!(config.has_hostpass(Path::new("/opt/app/bin/service")));
-        assert!(!config.has_hostpass(Path::new("/usr/bin/other-app")));
-        assert!(!config.has_hostpass(Path::new("/usr/bin/my-sandbox-app-extra")));
+        // Glob matching
+        assert!(config.has_hostpass(Path::new("/usr/bin/python3")));
+        assert!(config.has_hostpass(Path::new("/home/user/.venv/bin/python3.12")));
+        assert!(config.has_hostpass(Path::new("/opt/python/bin/python3.11")));
+
+        // Exact matching
+        assert!(config.has_hostpass(Path::new("/usr/bin/node")));
+
+        // No match
+        assert!(!config.has_hostpass(Path::new("/usr/bin/ruby")));
+        assert!(!config.has_hostpass(Path::new("/usr/bin/python2")));
     }
 
     #[test]

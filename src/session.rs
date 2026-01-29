@@ -2,7 +2,7 @@
 
 use crate::auth;
 use crate::config::Config;
-use crate::message::{read_message, Message, MessageType};
+use crate::message::{self, read_message, Message, MessageType};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -134,44 +134,78 @@ impl Session {
     /// Authenticate with the host bus.
     /// The host bus needs its own auth handshake.
     async fn auth_host_bus(&mut self) -> Result<()> {
-        // Send null byte
+        // Send null byte and EXTERNAL auth with hex-encoded UID
         self.host_bus.write_all(&[0]).await?;
-
-        // Send EXTERNAL auth with our UID
-        // UID must be encoded as hex of ASCII digits (e.g., 1000 -> "31303030")
         let uid = unsafe { libc::getuid() };
-        let uid_hex = uid
+        let uid_hex: String = uid
             .to_string()
-            .as_bytes()
-            .iter()
+            .bytes()
             .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-        let auth_cmd = format!("AUTH EXTERNAL {}\r\n", uid_hex);
-        self.host_bus.write_all(auth_cmd.as_bytes()).await?;
+            .collect();
+        self.host_bus
+            .write_all(format!("AUTH EXTERNAL {}\r\n", uid_hex).as_bytes())
+            .await?;
 
-        // Read response until we get OK
-        let mut buf = vec![0u8; 256];
-        let mut response = Vec::new();
-        loop {
-            let n = tokio::io::AsyncReadExt::read(&mut self.host_bus, &mut buf).await?;
-            if n == 0 {
-                bail!("Host bus disconnected during auth");
-            }
-            response.extend_from_slice(&buf[..n]);
-            if response.windows(2).any(|w| w == b"\r\n") {
-                break;
-            }
+        // Read auth response
+        let response = read_auth_line(&mut self.host_bus).await?;
+        if !response.starts_with("OK") {
+            bail!("Host bus auth failed: {}", response.trim());
         }
 
-        let response_str = String::from_utf8_lossy(&response);
-        if !response_str.starts_with("OK") {
-            bail!("Host bus auth failed: {}", response_str.trim());
-        }
+        // Negotiate UNIX FD passing
+        self.host_bus.write_all(b"NEGOTIATE_UNIX_FD\r\n").await?;
+        let response = read_auth_line(&mut self.host_bus).await?;
+        tracing::debug!(response = %response.trim(), "Host bus NEGOTIATE_UNIX_FD response");
 
-        // Send BEGIN to finish auth
+        // Send BEGIN and Hello() to complete authentication
         self.host_bus.write_all(b"BEGIN\r\n").await?;
+        self.send_host_hello().await
+    }
 
-        Ok(())
+    /// Send Hello() method call to host bus and read the response.
+    /// This registers the router's connection with the host bus daemon.
+    async fn send_host_hello(&mut self) -> Result<()> {
+        use zvariant::{serialized::Context, to_bytes, ObjectPath, Value, LE};
+
+        // Build header fields array for Hello() call
+        let path = ObjectPath::try_from("/org/freedesktop/DBus").unwrap();
+        let fields: Vec<(u8, Value)> = vec![
+            (1, Value::ObjectPath(path)),                   // PATH
+            (2, Value::Str("org.freedesktop.DBus".into())), // INTERFACE
+            (3, Value::Str("Hello".into())),                // MEMBER
+            (6, Value::Str("org.freedesktop.DBus".into())), // DESTINATION
+        ];
+
+        let ctxt = Context::new_dbus(LE, 12);
+        let fields_encoded = to_bytes(ctxt, &fields)?;
+        let array_len = fields_encoded.len() - 4; // Exclude 4-byte length prefix
+
+        // Calculate padding to 8-byte boundary
+        let header_end = 16 + array_len;
+        let padding = (8 - (header_end % 8)) % 8;
+
+        // Build D-Bus message: fixed header + fields + padding
+        let mut msg = Vec::with_capacity(16 + array_len + padding);
+        msg.extend_from_slice(&[b'l', 1, 0, 1]); // endian, method_call, flags, version
+        msg.extend_from_slice(&0u32.to_le_bytes()); // body length
+        msg.extend_from_slice(&1u32.to_le_bytes()); // serial
+        msg.extend_from_slice(&fields_encoded);
+        msg.resize(msg.len() + padding, 0);
+
+        self.host_bus.write_all(&msg).await?;
+
+        // Read and validate response
+        match message::read_message(&mut self.host_bus).await? {
+            Some(resp) if resp.header.msg_type == MessageType::MethodReturn => {
+                tracing::debug!("Host bus Hello() succeeded");
+                Ok(())
+            }
+            Some(resp) if resp.header.msg_type == MessageType::Error => {
+                bail!("Host bus Hello() failed with error")
+            }
+            Some(resp) => bail!("Unexpected response to Hello(): {:?}", resp.header.msg_type),
+            None => bail!("Host bus disconnected after Hello()"),
+        }
     }
 
     /// Forward messages between client and upstream buses with routing.
@@ -369,6 +403,25 @@ async fn connect_abstract(name: &str) -> Result<UnixStream> {
 #[cfg(not(target_os = "linux"))]
 async fn connect_abstract(_name: &str) -> Result<UnixStream> {
     bail!("Abstract sockets are only supported on Linux");
+}
+
+/// Read a single line from a D-Bus auth handshake (terminated by CRLF).
+async fn read_auth_line(stream: &mut UnixStream) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = [0u8; 256];
+    let mut response = Vec::new();
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            bail!("Connection closed during auth");
+        }
+        response.extend_from_slice(&buf[..n]);
+        if response.windows(2).any(|w| w == b"\r\n") {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
 /// Parse a D-Bus address string to extract the Unix socket address.
