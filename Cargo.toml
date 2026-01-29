@@ -1,0 +1,25 @@
+[package]
+name = "dbus-router"
+version = "0.1.0"
+edition = "2021"
+description = "A dual-upstream D-Bus router library"
+
+[lib]
+name = "dbus_router"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dbus-router"
+path = "src/bin/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+libc = "0.2"
+
+# Only needed for the test binary
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,24 @@
+# D-Bus Router Configuration
+#
+# Routes matching these destinations to the host bus.
+# All other traffic goes to the sandbox bus (default).
+#
+# Supports:
+# - Exact match: "org.freedesktop.DBus"
+# - Wildcard match: "org.freedesktop.portal.*"
+
+# D-Bus daemon itself (for ListNames, GetNameOwner, etc.)
+[[host_routes]]
+destination = "org.freedesktop.DBus"
+
+# XDG Desktop Portals (file chooser, notifications, etc.)
+[[host_routes]]
+destination = "org.freedesktop.portal.*"
+
+# Flatpak runtime
+[[host_routes]]
+destination = "org.freedesktop.Flatpak"
+
+# Secrets service (GNOME Keyring, KWallet)
+[[host_routes]]
+destination = "org.freedesktop.secrets"
