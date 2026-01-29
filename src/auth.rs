@@ -85,9 +85,7 @@ pub async fn auth_passthrough(client: &mut UnixStream, bus: &mut UnixStream) -> 
 
                 // Track responses
                 if is_agree_unix_fd(&line) || is_error_line(&line) {
-                    if pending_responses > 0 {
-                        pending_responses -= 1;
-                    }
+                    pending_responses = pending_responses.saturating_sub(1);
                     tracing::debug!(pending = pending_responses, "Response received");
                 }
 

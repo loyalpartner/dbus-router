@@ -306,13 +306,13 @@ impl Session {
 
 /// Determine which bus to route a request to based on destination.
 fn route_request(config: &Config, msg: &Message, client_exe: Option<&Path>) -> Bus {
-    // Special case: RequestName from process with hostpass -> host bus
-    if msg.is_request_name() {
-        if let Some(exe) = client_exe {
-            if config.has_hostpass(exe) {
-                tracing::debug!(exe = %exe.display(), "Routing RequestName to host (hostpass)");
-                return Bus::Host;
-            }
+    // Hostpass: route ALL messages from hostpass processes to host bus
+    // This is required because D-Bus requires Hello() before any other operations,
+    // and the host bus won't accept messages from connections that haven't called Hello()
+    if let Some(exe) = client_exe {
+        if config.has_hostpass(exe) {
+            tracing::debug!(exe = %exe.display(), "Routing to host (hostpass)");
+            return Bus::Host;
         }
     }
 

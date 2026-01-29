@@ -11,6 +11,7 @@
 
 use anyhow::{bail, Result};
 use tokio::io::{AsyncRead, AsyncReadExt};
+use zvariant::{serialized::Context, Endian as ZEndian, Value};
 
 /// Maximum D-Bus message size (128 MB per spec, but we use 64 MB limit).
 const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
@@ -57,39 +58,6 @@ impl Endian {
         match self {
             Endian::Little => u32::from_le_bytes(arr),
             Endian::Big => u32::from_be_bytes(arr),
-        }
-    }
-}
-
-/// D-Bus header field codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum HeaderField {
-    Invalid = 0,
-    Path = 1,
-    Interface = 2,
-    Member = 3,
-    ErrorName = 4,
-    ReplySerial = 5,
-    Destination = 6,
-    Sender = 7,
-    Signature = 8,
-    UnixFds = 9,
-}
-
-impl From<u8> for HeaderField {
-    fn from(v: u8) -> Self {
-        match v {
-            1 => HeaderField::Path,
-            2 => HeaderField::Interface,
-            3 => HeaderField::Member,
-            4 => HeaderField::ErrorName,
-            5 => HeaderField::ReplySerial,
-            6 => HeaderField::Destination,
-            7 => HeaderField::Sender,
-            8 => HeaderField::Signature,
-            9 => HeaderField::UnixFds,
-            _ => HeaderField::Invalid,
         }
     }
 }
@@ -251,191 +219,59 @@ struct ParsedHeaderFields {
     member: Option<String>,
 }
 
-/// Parse header fields to extract destination, reply_serial, sender, interface, and member.
+/// D-Bus header field as (code, value) tuple - signature a(yv)
+type HeaderFieldTuple<'a> = (u8, Value<'a>);
+
+/// Parse header fields using zvariant to extract destination, reply_serial, sender, interface, and member.
 fn parse_header_fields(buf: &[u8], endian: Endian) -> Result<ParsedHeaderFields> {
-    let mut fields = ParsedHeaderFields::default();
+    let z_endian = match endian {
+        Endian::Little => ZEndian::Little,
+        Endian::Big => ZEndian::Big,
+    };
 
-    let mut pos = 0;
-    while pos < buf.len() {
-        // Align to 8-byte boundary for struct
-        pos = align_to(pos, 8);
-        if pos >= buf.len() {
-            break;
+    // Header fields array signature is a(yv) - array of (byte, variant)
+    // The buf already contains just the array data (after the 4-byte length prefix)
+    // We need to prepend the array length back for zvariant to parse correctly
+    let array_len = buf.len() as u32;
+    let mut full_buf = Vec::with_capacity(4 + buf.len());
+    match endian {
+        Endian::Little => full_buf.extend_from_slice(&array_len.to_le_bytes()),
+        Endian::Big => full_buf.extend_from_slice(&array_len.to_be_bytes()),
+    }
+    full_buf.extend_from_slice(buf);
+
+    // Position 12: header fields array starts at byte 12 in D-Bus header
+    // After 4-byte array length (at pos 12), we're at pos 16 which is 8-byte aligned
+    // So no padding is needed between length and array content
+    let ctxt = Context::new_dbus(z_endian, 12);
+    let data = zvariant::serialized::Data::new(&full_buf, ctxt);
+
+    let fields: Vec<HeaderFieldTuple> = match data.deserialize::<Vec<HeaderFieldTuple>>() {
+        Ok((fields, _)) => fields,
+        Err(e) => {
+            tracing::warn!("Failed to parse header fields with zvariant: {}", e);
+            return Ok(ParsedHeaderFields::default());
         }
+    };
 
-        // Field code (1 byte)
-        let field_code = HeaderField::from(buf[pos]);
-        pos += 1;
-
-        if pos >= buf.len() {
-            break;
-        }
-
-        // Signature (1 byte length + signature string + null)
-        let sig_len = buf[pos] as usize;
-        pos += 1;
-
-        if pos + sig_len >= buf.len() {
-            break;
-        }
-
-        let signature = &buf[pos..pos + sig_len];
-        pos += sig_len + 1; // +1 for null terminator
-
-        // Align to value type alignment
-        match (field_code, signature) {
-            (HeaderField::Destination, b"s")
-            | (HeaderField::Sender, b"s")
-            | (HeaderField::Interface, b"s")
-            | (HeaderField::Member, b"s") => {
-                pos = align_to(pos, 4);
-                if pos + 4 > buf.len() {
-                    break;
-                }
-                let str_len = endian.read_u32(&buf[pos..pos + 4]) as usize;
-                pos += 4;
-                if pos + str_len > buf.len() {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&buf[pos..pos + str_len]).to_string();
-                pos += str_len + 1; // +1 for null terminator
-
-                match field_code {
-                    HeaderField::Destination => fields.destination = Some(s),
-                    HeaderField::Sender => fields.sender = Some(s),
-                    HeaderField::Interface => fields.interface = Some(s),
-                    HeaderField::Member => fields.member = Some(s),
-                    _ => unreachable!(),
-                }
-            }
-            (HeaderField::ReplySerial, b"u") => {
-                pos = align_to(pos, 4);
-                if pos + 4 > buf.len() {
-                    break;
-                }
-                fields.reply_serial = Some(endian.read_u32(&buf[pos..pos + 4]));
-                pos += 4;
-            }
-            _ => {
-                // Skip other fields based on their signature
-                if let Some(new_pos) = skip_field_value(buf, pos, signature, endian) {
-                    pos = new_pos;
-                } else {
-                    // Can't parse, stop processing
-                    break;
-                }
-            }
+    let mut result = ParsedHeaderFields::default();
+    for (code, value) in fields {
+        match code {
+            1 => { /* PATH - skip for now */ }
+            2 => result.interface = String::try_from(&value).ok(),
+            3 => result.member = String::try_from(&value).ok(),
+            5 => result.reply_serial = u32::try_from(&value).ok(),
+            6 => result.destination = String::try_from(&value).ok(),
+            7 => result.sender = String::try_from(&value).ok(),
+            _ => { /* skip unknown fields */ }
         }
     }
-
-    Ok(fields)
-}
-
-/// Skip a field value based on its signature.
-/// Returns the new position after the value, or None if parsing fails.
-fn skip_field_value(buf: &[u8], pos: usize, signature: &[u8], endian: Endian) -> Option<usize> {
-    if signature.is_empty() {
-        return Some(pos);
-    }
-
-    match signature[0] {
-        // STRING or OBJECT_PATH: u32 length + bytes + null (aligned to 4)
-        b's' | b'o' => {
-            let pos = align_to(pos, 4);
-            if pos + 4 > buf.len() {
-                return None;
-            }
-            let str_len = endian.read_u32(&buf[pos..pos + 4]) as usize;
-            let end = pos + 4 + str_len + 1; // +1 for null terminator
-            if end > buf.len() {
-                return None;
-            }
-            Some(end)
-        }
-        // SIGNATURE: u8 length + bytes + null (no alignment needed)
-        b'g' => {
-            if pos >= buf.len() {
-                return None;
-            }
-            let sig_len = buf[pos] as usize;
-            let end = pos + 1 + sig_len + 1; // +1 for length byte, +1 for null
-            if end > buf.len() {
-                return None;
-            }
-            Some(end)
-        }
-        // UINT32: 4 bytes (aligned to 4)
-        b'u' | b'i' | b'b' => {
-            let pos = align_to(pos, 4);
-            if pos + 4 > buf.len() {
-                return None;
-            }
-            Some(pos + 4)
-        }
-        // UINT16 / INT16: 2 bytes (aligned to 2)
-        b'n' | b'q' => {
-            let pos = align_to(pos, 2);
-            if pos + 2 > buf.len() {
-                return None;
-            }
-            Some(pos + 2)
-        }
-        // BYTE: 1 byte (no alignment)
-        b'y' => {
-            if pos >= buf.len() {
-                return None;
-            }
-            Some(pos + 1)
-        }
-        // UINT64 / INT64 / DOUBLE: 8 bytes (aligned to 8)
-        b'x' | b't' | b'd' => {
-            let pos = align_to(pos, 8);
-            if pos + 8 > buf.len() {
-                return None;
-            }
-            Some(pos + 8)
-        }
-        // UNIX_FD: same as u32
-        b'h' => {
-            let pos = align_to(pos, 4);
-            if pos + 4 > buf.len() {
-                return None;
-            }
-            Some(pos + 4)
-        }
-        // Unknown signature - can't skip safely
-        _ => {
-            tracing::warn!(
-                signature = %String::from_utf8_lossy(signature),
-                "Unknown signature in header field, cannot skip"
-            );
-            None
-        }
-    }
-}
-
-/// Align position to the given boundary.
-fn align_to(pos: usize, alignment: usize) -> usize {
-    (pos + alignment - 1) & !(alignment - 1)
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_align_to() {
-        assert_eq!(align_to(0, 8), 0);
-        assert_eq!(align_to(1, 8), 8);
-        assert_eq!(align_to(7, 8), 8);
-        assert_eq!(align_to(8, 8), 8);
-        assert_eq!(align_to(9, 8), 16);
-
-        assert_eq!(align_to(0, 4), 0);
-        assert_eq!(align_to(1, 4), 4);
-        assert_eq!(align_to(3, 4), 4);
-        assert_eq!(align_to(4, 4), 4);
-    }
 
     #[test]
     fn test_endian_read_u32() {
@@ -519,85 +355,29 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_field_value() {
-        let endian = Endian::Little;
-
-        // Test string (signature "s")
-        // Format: u32 length + bytes + null
-        let mut buf = vec![0, 0, 0, 0]; // padding for alignment
-        buf.extend_from_slice(&5u32.to_le_bytes()); // length = 5
-        buf.extend_from_slice(b"hello\0"); // string + null
-        let result = skip_field_value(&buf, 4, b"s", endian);
-        assert_eq!(result, Some(4 + 4 + 5 + 1)); // aligned pos + len + string + null
-
-        // Test object path (signature "o") - same as string
-        let result = skip_field_value(&buf, 4, b"o", endian);
-        assert_eq!(result, Some(4 + 4 + 5 + 1));
-
-        // Test signature (signature "g")
-        // Format: u8 length + bytes + null
-        let buf = vec![3, b'u', b'u', b's', 0]; // length=3, "uus", null
-        let result = skip_field_value(&buf, 0, b"g", endian);
-        assert_eq!(result, Some(1 + 3 + 1)); // len byte + signature + null
-
-        // Test uint32 (signature "u")
-        let buf = vec![0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12];
-        let result = skip_field_value(&buf, 4, b"u", endian);
-        assert_eq!(result, Some(8));
-
-        // Test byte (signature "y")
-        let buf = vec![42];
-        let result = skip_field_value(&buf, 0, b"y", endian);
-        assert_eq!(result, Some(1));
-    }
-
-    #[test]
     fn test_parse_header_fields_with_path() {
-        // Simulate header fields with PATH before DESTINATION
-        // PATH (field 1, sig "o") + DESTINATION (field 6, sig "s")
-        let endian = Endian::Little;
+        use zvariant::{serialized::Context, to_bytes, ObjectPath, Value, LE};
 
-        let mut buf = Vec::new();
+        // Create header fields using zvariant serialization
+        // Header fields are a(yv) - array of (byte field_code, variant value)
+        let path = ObjectPath::try_from("/org/freedesktop/DBus").unwrap();
+        let fields: Vec<(u8, Value)> = vec![
+            (1, Value::ObjectPath(path)),                               // PATH
+            (6, Value::Str("org.freedesktop.DBus".to_string().into())), // DESTINATION
+        ];
 
-        // Field 1: PATH (object path "/org/freedesktop/DBus")
-        // Struct alignment (8 bytes) - at position 0, already aligned
-        buf.push(1); // field code: PATH
-        buf.push(1); // signature length
-        buf.push(b'o'); // signature: object path
-        buf.push(0); // null terminator
+        // Use position 12 to match actual D-Bus header layout
+        // Header fields array starts at byte 12, after 4-byte length we're at 16 (8-aligned)
+        let ctxt = Context::new_dbus(LE, 12);
+        let encoded = to_bytes(ctxt, &fields).unwrap();
 
-        // Align to 4 for string length
-        while buf.len() % 4 != 0 {
-            buf.push(0);
-        }
-        let path = b"/org/freedesktop/DBus";
-        buf.extend_from_slice(&(path.len() as u32).to_le_bytes());
-        buf.extend_from_slice(path);
-        buf.push(0); // null terminator
+        // The encoded data structure from to_bytes at position 12:
+        // - 4 bytes: array length
+        // - N bytes: array content (no padding since 16 is 8-aligned)
+        // parse_header_fields expects just the array content (no length prefix)
+        let buf = &encoded[4..];
 
-        // Field 6: DESTINATION (string "org.freedesktop.DBus")
-        // Align to 8 for struct
-        while buf.len() % 8 != 0 {
-            buf.push(0);
-        }
-        buf.push(6); // field code: DESTINATION
-        buf.push(1); // signature length
-        buf.push(b's'); // signature: string
-        buf.push(0); // null terminator
-
-        // Align to 4 for string length
-        while buf.len() % 4 != 0 {
-            buf.push(0);
-        }
-        let dest = b"org.freedesktop.DBus";
-        buf.extend_from_slice(&(dest.len() as u32).to_le_bytes());
-        buf.extend_from_slice(dest);
-        buf.push(0); // null terminator
-
-        let fields = parse_header_fields(&buf, endian).unwrap();
-        assert_eq!(
-            fields.destination,
-            Some("org.freedesktop.DBus".to_string())
-        );
+        let parsed = parse_header_fields(buf, Endian::Little).unwrap();
+        assert_eq!(parsed.destination, Some("org.freedesktop.DBus".to_string()));
     }
 }
