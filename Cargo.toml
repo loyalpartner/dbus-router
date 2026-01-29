@@ -3,6 +3,10 @@ name = "dbus-router"
 version = "0.3.1"
 edition = "2021"
 description = "A dual-upstream D-Bus router library"
+license = "MIT"
+repository = "https://github.com/loyalpartner/dbus-router"
+keywords = ["dbus", "router", "ipc"]
+categories = ["network-programming"]
 
 [lib]
 name = "dbus_router"
