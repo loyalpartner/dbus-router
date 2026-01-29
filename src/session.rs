@@ -116,15 +116,23 @@ impl Session {
 
     /// Run the session: authenticate with both buses, then forward messages.
     pub async fn run(mut self) -> Result<()> {
+        // Check if this is a hostpass client
+        let is_hostpass = self
+            .client_exe_path
+            .as_ref()
+            .map(|p| self.config.has_hostpass(p))
+            .unwrap_or(false);
+
         // Phase 1: Auth passthrough with sandbox bus
         tracing::debug!("Starting auth phase with sandbox bus");
         auth::auth_passthrough(&mut self.client, &mut self.sandbox_bus).await?;
         tracing::info!("Auth with sandbox bus completed");
 
         // Phase 1b: Also authenticate with host bus (using same credentials)
-        // We send a minimal auth sequence to the host bus
+        // For hostpass clients, skip Hello() - their Hello() will be forwarded to host bus
+        // For non-hostpass clients, send Hello() so host_routes messages can be routed
         tracing::debug!("Starting auth phase with host bus");
-        self.auth_host_bus().await?;
+        self.auth_host_bus(is_hostpass).await?;
         tracing::info!("Auth with host bus completed, starting message forwarding");
 
         // Phase 2: Message forwarding with routing
@@ -133,7 +141,9 @@ impl Session {
 
     /// Authenticate with the host bus.
     /// The host bus needs its own auth handshake.
-    async fn auth_host_bus(&mut self) -> Result<()> {
+    /// If `skip_hello` is true, skip the Hello() call (for hostpass clients whose
+    /// Hello() will be forwarded to the host bus).
+    async fn auth_host_bus(&mut self, skip_hello: bool) -> Result<()> {
         // Send null byte and EXTERNAL auth with hex-encoded UID
         self.host_bus.write_all(&[0]).await?;
         let uid = unsafe { libc::getuid() };
@@ -157,9 +167,15 @@ impl Session {
         let response = read_auth_line(&mut self.host_bus).await?;
         tracing::debug!(response = %response.trim(), "Host bus NEGOTIATE_UNIX_FD response");
 
-        // Send BEGIN and Hello() to complete authentication
+        // Send BEGIN to complete SASL auth
         self.host_bus.write_all(b"BEGIN\r\n").await?;
-        self.send_host_hello().await
+
+        if skip_hello {
+            tracing::debug!("Skipping Hello() for hostpass client");
+            Ok(())
+        } else {
+            self.send_host_hello().await
+        }
     }
 
     /// Send Hello() method call to host bus and read the response.
