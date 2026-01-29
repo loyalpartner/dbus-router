@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/loyalpartner/dbus-router/compare/v0.3.1...v0.3.2) (2026-01-29)
+
+
+### Bug Fixes
+
+* add required crates.io metadata fields ([e76b250](https://github.com/loyalpartner/dbus-router/commit/e76b2504a9764d430a60cc412e67a8ba8dbafa4b))
+
 ## [0.3.1](https://github.com/loyalpartner/dbus-router/compare/v0.3.0...v0.3.1) (2026-01-29)
 
 
