@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/loyalpartner/dbus-router/compare/v0.5.1...v0.5.2) (2026-01-29)
+
+
+### Bug Fixes
+
+* skip Hello() for hostpass clients to prevent duplicate Hello error ([96e5df9](https://github.com/loyalpartner/dbus-router/commit/96e5df9d990e31ea5bf0391269cff41b536a026e))
+
 ## [0.5.1](https://github.com/loyalpartner/dbus-router/compare/v0.5.0...v0.5.1) (2026-01-29)
 
 
