@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/loyalpartner/dbus-router/compare/v0.5.0...v0.5.1) (2026-01-29)
+
+
+### Bug Fixes
+
+* consume NameAcquired signal after Hello() on host bus ([8590944](https://github.com/loyalpartner/dbus-router/commit/8590944fc646ef196c4ee95e6931b11e51e8d48e))
+
 ## [0.5.0](https://github.com/loyalpartner/dbus-router/compare/v0.4.3...v0.5.0) (2026-01-29)
 
 
