@@ -5,6 +5,7 @@ import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Generator
 
 
 @contextmanager
@@ -105,6 +106,42 @@ def dbus_router_session(
     time.sleep(0.5)
     try:
         yield f"unix:path={listen_path}"
+    finally:
+        proc.terminate()
+        proc.wait()
+        stdout.close()
+        stderr.close()
+
+
+@contextmanager
+def echo_service_session(
+    dbus_addr: str, log_dir: Path
+) -> Generator[subprocess.Popen, None, None]:
+    """Start the Echo D-Bus service.
+
+    Args:
+        dbus_addr: D-Bus address for the service to connect to
+        log_dir: Directory for log files
+
+    Yields:
+        subprocess.Popen object for the service
+    """
+    env = os.environ.copy()
+    env["DBUS_SESSION_BUS_ADDRESS"] = dbus_addr
+
+    script_path = Path(__file__).parent / "echo_service.py"
+    stdout = open(log_dir / "echo-service.stdout", "w")
+    stderr = open(log_dir / "echo-service.stderr", "w")
+
+    proc = subprocess.Popen(
+        ["python3", str(script_path)],
+        stdout=stdout,
+        stderr=stderr,
+        env=env,
+    )
+    time.sleep(0.5)  # Wait for service registration
+    try:
+        yield proc
     finally:
         proc.terminate()
         proc.wait()

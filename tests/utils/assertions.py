@@ -1,7 +1,21 @@
 """D-Bus specific test assertions."""
 
+import asyncio
 import subprocess
 from pathlib import Path
+
+from dbus_next.aio import MessageBus
+
+
+async def _list_names(dbus_addr: str) -> list[str]:
+    """List all names on the bus using dbus-next."""
+    bus = await MessageBus(bus_address=dbus_addr).connect()
+    introspection = await bus.introspect('org.freedesktop.DBus', '/org/freedesktop/DBus')
+    proxy = bus.get_proxy_object('org.freedesktop.DBus', '/org/freedesktop/DBus', introspection)
+    interface = proxy.get_interface('org.freedesktop.DBus')
+    names = await interface.call_list_names()
+    bus.disconnect()
+    return names
 
 
 def assert_dbus_service_exists(dbus_addr: str, service_name: str):
@@ -11,14 +25,19 @@ def assert_dbus_service_exists(dbus_addr: str, service_name: str):
         dbus_addr: D-Bus address to connect to
         service_name: Service name to check (e.g., "org.freedesktop.Notifications")
     """
-    result = subprocess.run(
-        ["dbus-send", "--print-reply", f"--address={dbus_addr}",
-         "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
-         "org.freedesktop.DBus.ListNames"],
-        capture_output=True, text=True
-    )
-    assert result.returncode == 0, f"Failed to list D-Bus names: {result.stderr}"
-    assert service_name in result.stdout, f"Service {service_name} not found on bus"
+    names = asyncio.run(_list_names(dbus_addr))
+    assert service_name in names, f"Service {service_name} not found on bus. Available: {names}"
+
+
+def assert_dbus_service_not_exists(dbus_addr: str, service_name: str):
+    """Assert that a D-Bus service is NOT registered on the bus.
+
+    Args:
+        dbus_addr: D-Bus address to connect to
+        service_name: Service name that should not exist
+    """
+    names = asyncio.run(_list_names(dbus_addr))
+    assert service_name not in names, f"Service {service_name} should not be on bus, but was found"
 
 
 def assert_log_contains(log_file: Path, pattern: str):

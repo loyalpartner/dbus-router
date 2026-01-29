@@ -1,24 +1,19 @@
-.PHONY: build test test-headless test-parallel clean
+.PHONY: build test test-unit test-integration clean
 
 # Build the project in release mode
 build:
 	cargo build --release
 
-# Run visual tests with Xephyr on host display
-test: build
-	cd tests && uv run pytest -v -m xorg
+# Run all tests
+test: test-unit test-integration
 
-# Run headless tests with Xvfb
-test-headless: build
-	cd tests && HSDBUS_HEADLESS=1 uv run pytest -v -m xorg
-
-# Run parallel headless tests
-test-parallel: build
-	cd tests && HSDBUS_HEADLESS=1 uv run pytest -v -m xorg -n auto --dist loadfile
-
-# Run unit tests only (Rust)
+# Run unit tests (Rust)
 test-unit:
 	cargo test
+
+# Run integration tests (Python)
+test-integration: build
+	cd tests && uv run pytest -v
 
 # Clean build artifacts
 clean:
