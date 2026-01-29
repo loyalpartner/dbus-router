@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/loyalpartner/dbus-router/compare/v0.3.2...v0.4.0) (2026-01-29)
+
+
+### Features
+
+* add hostpass for sandbox service export to host bus ([15ff494](https://github.com/loyalpartner/dbus-router/commit/15ff4940212c07cf51456d9ce35fcbee13a03759))
+
 ## [0.3.2](https://github.com/loyalpartner/dbus-router/compare/v0.3.1...v0.3.2) (2026-01-29)
 
 
