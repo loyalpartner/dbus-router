@@ -43,7 +43,7 @@ sequenceDiagram
         Router-->>App: OK
         App->>Router: BEGIN
 
-        Note right of Router: Router authenticates with Host
+        Note right of Router: Router authenticates with Host<br/>(Hello() only for non-hostpass clients)
         Router->>Host: AUTH EXTERNAL + BEGIN
         Router->>Host: Hello()
         Host-->>Router: unique name :1.x
@@ -77,6 +77,12 @@ sequenceDiagram
     %% ========== Phase 4: Hostpass Mode ==========
     rect rgb(255, 240, 245)
         Note over App,Host: Phase 4: Hostpass (config: */python3*)
+
+        Note right of Router: Router skips Hello() on Host bus<br/>Client's Hello() will be forwarded
+        App->>Router: Hello()
+        Router->>Host: Hello()
+        Host-->>Router: unique name :1.y
+        Router-->>App: unique name :1.y
 
         Note right of Router: All messages route to Host
         App->>Router: RequestName("org.test.Svc")
