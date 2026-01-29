@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/loyalpartner/dbus-router/compare/v0.3.0...v0.3.1) (2026-01-29)
+
+
+### Bug Fixes
+
+* use correct release-please output names for root path ([328d68a](https://github.com/loyalpartner/dbus-router/commit/328d68a297ae069b2230d145f8c10420662a5005))
+
 ## [0.3.0](https://github.com/loyalpartner/dbus-router/compare/v0.2.1...v0.3.0) (2026-01-29)
 
 
