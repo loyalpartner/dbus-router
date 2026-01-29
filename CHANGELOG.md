@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/loyalpartner/dbus-router/compare/v0.4.2...v0.4.3) (2026-01-29)
+
+
+### Bug Fixes
+
+* use zvariant for D-Bus header parsing and fix hostpass routing ([c423dd1](https://github.com/loyalpartner/dbus-router/commit/c423dd1d7df5ef259f2ae890fd7c8e33519d66bf))
+
 ## [0.4.2](https://github.com/loyalpartner/dbus-router/compare/v0.4.1...v0.4.2) (2026-01-29)
 
 
