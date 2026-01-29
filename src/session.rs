@@ -168,6 +168,26 @@ impl Session {
             bail!("Host bus auth failed: {}", response_str.trim());
         }
 
+        // Negotiate UNIX FD passing (same as client does with sandbox)
+        self.host_bus.write_all(b"NEGOTIATE_UNIX_FD\r\n").await?;
+
+        // Read response (AGREE_UNIX_FD or ERROR)
+        response.clear();
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut self.host_bus, &mut buf).await?;
+            if n == 0 {
+                bail!("Host bus disconnected during NEGOTIATE_UNIX_FD");
+            }
+            response.extend_from_slice(&buf[..n]);
+            if response.windows(2).any(|w| w == b"\r\n") {
+                break;
+            }
+        }
+        tracing::debug!(
+            response = %String::from_utf8_lossy(&response).trim(),
+            "Host bus NEGOTIATE_UNIX_FD response"
+        );
+
         // Send BEGIN to finish auth
         self.host_bus.write_all(b"BEGIN\r\n").await?;
 
