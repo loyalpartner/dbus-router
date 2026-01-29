@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/loyalpartner/dbus-router/compare/v0.4.0...v0.4.1) (2026-01-29)
+
+
+### Bug Fixes
+
+* wait for NEGOTIATE_UNIX_FD response before completing auth ([1d61aec](https://github.com/loyalpartner/dbus-router/commit/1d61aec41b059e2a75ec1c8cd34e8259e240310f))
+
 ## [0.4.0](https://github.com/loyalpartner/dbus-router/compare/v0.3.2...v0.4.0) (2026-01-29)
 
 
