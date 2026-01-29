@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/loyalpartner/dbus-router/compare/v0.4.3...v0.5.0) (2026-01-29)
+
+
+### Features
+
+* **router:** add comprehensive integration tests ([43577cc](https://github.com/loyalpartner/dbus-router/commit/43577cc753189cc9bbe1715469ece965cad1ea6a))
+* **testing:** add comprehensive integration test framework ([43577cc](https://github.com/loyalpartner/dbus-router/commit/43577cc753189cc9bbe1715469ece965cad1ea6a))
+
 ## [0.4.3](https://github.com/loyalpartner/dbus-router/compare/v0.4.2...v0.4.3) (2026-01-29)
 
 
