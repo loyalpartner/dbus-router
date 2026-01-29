@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/loyalpartner/dbus-router/compare/v0.2.1...v0.3.0) (2026-01-29)
+
+
+### Features
+
+* add workflow_dispatch to publish workflow ([db26e57](https://github.com/loyalpartner/dbus-router/commit/db26e57addd9aff1ef8ed4135163d0e510517644))
+
+
+### Bug Fixes
+
+* split release workflow to use release event trigger ([70e300a](https://github.com/loyalpartner/dbus-router/commit/70e300a037846eafa8021bc7dcd43d00efabf6a6))
+
 ## [0.2.1](https://github.com/loyalpartner/dbus-router/compare/v0.2.0...v0.2.1) (2026-01-29)
 
 
