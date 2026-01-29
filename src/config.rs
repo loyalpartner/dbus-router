@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Router configuration loaded from TOML file.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -10,6 +10,16 @@ pub struct Config {
     /// Routes that should go to the host bus instead of sandbox.
     #[serde(default)]
     pub host_routes: Vec<RouteRule>,
+    /// Processes allowed to register services on the host bus.
+    #[serde(default)]
+    pub hostpass: Vec<HostPass>,
+}
+
+/// A process allowed to register services on the host bus.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostPass {
+    /// Path to the executable.
+    pub process: PathBuf,
 }
 
 /// A routing rule that matches destinations.
@@ -36,6 +46,11 @@ impl Config {
         self.host_routes
             .iter()
             .any(|rule| rule.matches(destination))
+    }
+
+    /// Check if a process is allowed to register services on the host bus.
+    pub fn has_hostpass(&self, exe_path: &Path) -> bool {
+        self.hostpass.iter().any(|h| h.process == exe_path)
     }
 }
 
@@ -97,6 +112,7 @@ mod tests {
                     destination: "org.freedesktop.portal.*".to_string(),
                 },
             ],
+            ..Default::default()
         };
 
         assert!(config.should_route_to_host("org.freedesktop.DBus"));
@@ -125,6 +141,51 @@ destination = "org.freedesktop.portal.*"
         assert_eq!(
             config.host_routes[1].destination,
             "org.freedesktop.portal.*"
+        );
+    }
+
+    #[test]
+    fn test_has_hostpass() {
+        let config = Config {
+            host_routes: vec![],
+            hostpass: vec![
+                HostPass {
+                    process: PathBuf::from("/usr/bin/my-sandbox-app"),
+                },
+                HostPass {
+                    process: PathBuf::from("/opt/app/bin/service"),
+                },
+            ],
+        };
+
+        assert!(config.has_hostpass(Path::new("/usr/bin/my-sandbox-app")));
+        assert!(config.has_hostpass(Path::new("/opt/app/bin/service")));
+        assert!(!config.has_hostpass(Path::new("/usr/bin/other-app")));
+        assert!(!config.has_hostpass(Path::new("/usr/bin/my-sandbox-app-extra")));
+    }
+
+    #[test]
+    fn test_parse_toml_with_hostpass() {
+        let toml_str = r#"
+[[host_routes]]
+destination = "org.freedesktop.DBus"
+
+[[hostpass]]
+process = "/usr/bin/my-sandbox-app"
+
+[[hostpass]]
+process = "/opt/app/bin/service"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.host_routes.len(), 1);
+        assert_eq!(config.hostpass.len(), 2);
+        assert_eq!(
+            config.hostpass[0].process,
+            PathBuf::from("/usr/bin/my-sandbox-app")
+        );
+        assert_eq!(
+            config.hostpass[1].process,
+            PathBuf::from("/opt/app/bin/service")
         );
     }
 }

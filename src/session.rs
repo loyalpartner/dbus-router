@@ -2,10 +2,10 @@
 
 use crate::auth;
 use crate::config::Config;
-use crate::message::{read_message, Message};
+use crate::message::{read_message, Message, MessageType};
 use anyhow::{bail, Result};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -29,6 +29,65 @@ pub struct Session {
     config: Arc<Config>,
     /// Track which bus each outgoing serial was sent to (for routing replies)
     pending_calls: HashMap<u32, Bus>,
+    /// Client process executable path (for sandbox export permission check)
+    client_exe_path: Option<PathBuf>,
+    /// Services exported by this client to the host bus
+    exported_services: HashSet<String>,
+    /// Track incoming calls from host bus (serial -> source bus)
+    incoming_calls: HashMap<u32, Bus>,
+}
+
+/// Get the executable path of a peer process from a Unix socket.
+#[cfg(target_os = "linux")]
+fn get_peer_exe_path(stream: &UnixStream) -> Option<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+
+    // Get peer credentials using SO_PEERCRED
+    let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut ucred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if ret != 0 {
+        tracing::debug!(
+            "Failed to get peer credentials: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+
+    let pid = ucred.pid;
+    if pid <= 0 {
+        return None;
+    }
+
+    // Read /proc/{pid}/exe symlink
+    let exe_path = format!("/proc/{}/exe", pid);
+    match std::fs::read_link(&exe_path) {
+        Ok(path) => {
+            tracing::debug!(pid = pid, exe = %path.display(), "Got peer exe path");
+            Some(path)
+        }
+        Err(e) => {
+            tracing::debug!(pid = pid, error = %e, "Failed to read exe path");
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_peer_exe_path(_stream: &UnixStream) -> Option<PathBuf> {
+    None
 }
 
 impl Session {
@@ -39,6 +98,7 @@ impl Session {
         sandbox_addr: &str,
         config: Arc<Config>,
     ) -> Result<Self> {
+        let client_exe_path = get_peer_exe_path(&client);
         let host_bus = connect_dbus(host_addr).await?;
         let sandbox_bus = connect_dbus(sandbox_addr).await?;
 
@@ -48,6 +108,9 @@ impl Session {
             sandbox_bus,
             config,
             pending_calls: HashMap::new(),
+            client_exe_path,
+            exported_services: HashSet::new(),
+            incoming_calls: HashMap::new(),
         })
     }
 
@@ -127,7 +190,30 @@ impl Session {
                 result = read_message(&mut client_read) => {
                     match result {
                         Ok(Some(msg)) => {
-                            let target = route_request(&self.config, &msg);
+                            // Check if this is a reply to an incoming host call
+                            if matches!(msg.header.msg_type, MessageType::MethodReturn | MessageType::Error) {
+                                if let Some(reply_serial) = msg.header.reply_serial {
+                                    if let Some(Bus::Host) = self.incoming_calls.remove(&reply_serial) {
+                                        tracing::debug!(
+                                            reply_serial = reply_serial,
+                                            "Routing reply to host bus"
+                                        );
+                                        host_write.write_all(&msg.raw).await?;
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            let target = route_request(&self.config, &msg, self.client_exe_path.as_deref());
+
+                            // Track RequestName calls to know which services this client exports
+                            if msg.is_request_name() && target == Bus::Host {
+                                if let Some(name) = msg.extract_name_from_body() {
+                                    tracing::info!(service = %name, "Client exporting service to host bus");
+                                    self.exported_services.insert(name);
+                                }
+                            }
+
                             self.pending_calls.insert(msg.header.serial, target);
 
                             tracing::debug!(
@@ -158,6 +244,22 @@ impl Session {
                 result = read_message(&mut host_read) => {
                     match result {
                         Ok(Some(msg)) => {
+                            // Check if this is a call to an exported service
+                            if msg.header.msg_type == MessageType::MethodCall {
+                                if let Some(ref dest) = msg.header.destination {
+                                    if self.exported_services.contains(dest) {
+                                        tracing::debug!(
+                                            serial = msg.header.serial,
+                                            destination = %dest,
+                                            "Routing host call to client (exported service)"
+                                        );
+                                        self.incoming_calls.insert(msg.header.serial, Bus::Host);
+                                        client_write.write_all(&msg.raw).await?;
+                                        continue;
+                                    }
+                                }
+                            }
+
                             tracing::debug!(
                                 serial = msg.header.serial,
                                 reply_serial = ?msg.header.reply_serial,
@@ -203,8 +305,17 @@ impl Session {
 }
 
 /// Determine which bus to route a request to based on destination.
-#[allow(dead_code)] // pending_calls is tracked but not used for response routing yet
-fn route_request(config: &Config, msg: &Message) -> Bus {
+fn route_request(config: &Config, msg: &Message, client_exe: Option<&Path>) -> Bus {
+    // Special case: RequestName from process with hostpass -> host bus
+    if msg.is_request_name() {
+        if let Some(exe) = client_exe {
+            if config.has_hostpass(exe) {
+                tracing::debug!(exe = %exe.display(), "Routing RequestName to host (hostpass)");
+                return Bus::Host;
+            }
+        }
+    }
+
     // Method calls and signals with a destination are routed based on config
     if let Some(ref dest) = msg.header.destination {
         if config.should_route_to_host(dest) {

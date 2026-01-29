@@ -106,6 +106,8 @@ pub struct MessageHeader {
     pub destination: Option<String>,
     pub reply_serial: Option<u32>,
     pub sender: Option<String>,
+    pub interface: Option<String>,
+    pub member: Option<String>,
 }
 
 /// A complete D-Bus message (header + body as raw bytes).
@@ -114,6 +116,41 @@ pub struct Message {
     pub header: MessageHeader,
     /// Raw message bytes including header and body
     pub raw: Vec<u8>,
+}
+
+impl Message {
+    /// Check if this message is a RequestName call to the D-Bus daemon.
+    pub fn is_request_name(&self) -> bool {
+        self.header.destination.as_deref() == Some("org.freedesktop.DBus")
+            && self.header.interface.as_deref() == Some("org.freedesktop.DBus")
+            && self.header.member.as_deref() == Some("RequestName")
+    }
+
+    /// Extract the service name from RequestName body.
+    /// The body format is: STRING (name) + UINT32 (flags)
+    pub fn extract_name_from_body(&self) -> Option<String> {
+        // Body starts after header (aligned to 8 bytes)
+        // Find body start position in raw message
+        let fixed_header_size = 12;
+        let array_len = self.header.endian.read_u32(&self.raw[fixed_header_size..]);
+        let header_end = 16 + array_len as usize;
+        let padding = (8 - (header_end % 8)) % 8;
+        let body_start = header_end + padding;
+
+        if body_start + 4 > self.raw.len() {
+            return None;
+        }
+
+        // Parse STRING: u32 length + bytes + null terminator
+        let str_len = self.header.endian.read_u32(&self.raw[body_start..]) as usize;
+        let str_start = body_start + 4;
+
+        if str_start + str_len > self.raw.len() {
+            return None;
+        }
+
+        String::from_utf8(self.raw[str_start..str_start + str_len].to_vec()).ok()
+    }
 }
 
 /// Read a complete D-Bus message from the stream.
@@ -176,7 +213,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option
     }
 
     // Parse header fields
-    let (destination, reply_serial, sender) = parse_header_fields(&fields_buf, endian)?;
+    let fields = parse_header_fields(&fields_buf, endian)?;
 
     // Reconstruct raw message
     let total_len = FIXED_HEADER_SIZE + 4 + array_len as usize + padding + body_len as usize;
@@ -194,22 +231,29 @@ pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option
             flags,
             serial,
             body_len,
-            destination,
-            reply_serial,
-            sender,
+            destination: fields.destination,
+            reply_serial: fields.reply_serial,
+            sender: fields.sender,
+            interface: fields.interface,
+            member: fields.member,
         },
         raw,
     }))
 }
 
-/// Parse header fields to extract destination, reply_serial, and sender.
-fn parse_header_fields(
-    buf: &[u8],
-    endian: Endian,
-) -> Result<(Option<String>, Option<u32>, Option<String>)> {
-    let mut destination = None;
-    let mut reply_serial = None;
-    let mut sender = None;
+/// Parsed header fields.
+#[derive(Debug, Default)]
+struct ParsedHeaderFields {
+    destination: Option<String>,
+    reply_serial: Option<u32>,
+    sender: Option<String>,
+    interface: Option<String>,
+    member: Option<String>,
+}
+
+/// Parse header fields to extract destination, reply_serial, sender, interface, and member.
+fn parse_header_fields(buf: &[u8], endian: Endian) -> Result<ParsedHeaderFields> {
+    let mut fields = ParsedHeaderFields::default();
 
     let mut pos = 0;
     while pos < buf.len() {
@@ -240,7 +284,10 @@ fn parse_header_fields(
 
         // Align to value type alignment
         match (field_code, signature) {
-            (HeaderField::Destination, b"s") | (HeaderField::Sender, b"s") => {
+            (HeaderField::Destination, b"s")
+            | (HeaderField::Sender, b"s")
+            | (HeaderField::Interface, b"s")
+            | (HeaderField::Member, b"s") => {
                 pos = align_to(pos, 4);
                 if pos + 4 > buf.len() {
                     break;
@@ -253,10 +300,12 @@ fn parse_header_fields(
                 let s = String::from_utf8_lossy(&buf[pos..pos + str_len]).to_string();
                 pos += str_len + 1; // +1 for null terminator
 
-                if field_code == HeaderField::Destination {
-                    destination = Some(s);
-                } else {
-                    sender = Some(s);
+                match field_code {
+                    HeaderField::Destination => fields.destination = Some(s),
+                    HeaderField::Sender => fields.sender = Some(s),
+                    HeaderField::Interface => fields.interface = Some(s),
+                    HeaderField::Member => fields.member = Some(s),
+                    _ => unreachable!(),
                 }
             }
             (HeaderField::ReplySerial, b"u") => {
@@ -264,7 +313,7 @@ fn parse_header_fields(
                 if pos + 4 > buf.len() {
                     break;
                 }
-                reply_serial = Some(endian.read_u32(&buf[pos..pos + 4]));
+                fields.reply_serial = Some(endian.read_u32(&buf[pos..pos + 4]));
                 pos += 4;
             }
             _ => {
@@ -275,7 +324,7 @@ fn parse_header_fields(
         }
     }
 
-    Ok((destination, reply_serial, sender))
+    Ok(fields)
 }
 
 /// Align position to the given boundary.
@@ -323,5 +372,62 @@ mod tests {
         assert_eq!(MessageType::from(4), MessageType::Signal);
         assert_eq!(MessageType::from(0), MessageType::Invalid);
         assert_eq!(MessageType::from(255), MessageType::Invalid);
+    }
+
+    #[test]
+    fn test_is_request_name() {
+        // Create a message header for RequestName
+        let msg = Message {
+            header: MessageHeader {
+                endian: Endian::Little,
+                msg_type: MessageType::MethodCall,
+                flags: 0,
+                serial: 1,
+                body_len: 0,
+                destination: Some("org.freedesktop.DBus".to_string()),
+                reply_serial: None,
+                sender: None,
+                interface: Some("org.freedesktop.DBus".to_string()),
+                member: Some("RequestName".to_string()),
+            },
+            raw: vec![],
+        };
+        assert!(msg.is_request_name());
+
+        // Not a RequestName - different member
+        let msg2 = Message {
+            header: MessageHeader {
+                endian: Endian::Little,
+                msg_type: MessageType::MethodCall,
+                flags: 0,
+                serial: 1,
+                body_len: 0,
+                destination: Some("org.freedesktop.DBus".to_string()),
+                reply_serial: None,
+                sender: None,
+                interface: Some("org.freedesktop.DBus".to_string()),
+                member: Some("Hello".to_string()),
+            },
+            raw: vec![],
+        };
+        assert!(!msg2.is_request_name());
+
+        // Not a RequestName - different destination
+        let msg3 = Message {
+            header: MessageHeader {
+                endian: Endian::Little,
+                msg_type: MessageType::MethodCall,
+                flags: 0,
+                serial: 1,
+                body_len: 0,
+                destination: Some("org.example.Service".to_string()),
+                reply_serial: None,
+                sender: None,
+                interface: Some("org.freedesktop.DBus".to_string()),
+                member: Some("RequestName".to_string()),
+            },
+            raw: vec![],
+        };
+        assert!(!msg3.is_request_name());
     }
 }
