@@ -194,11 +194,17 @@ impl Session {
 
         self.host_bus.write_all(&msg).await?;
 
-        // Read and validate response
+        // Read and validate response.
+        // After Hello(), the bus daemon sends:
+        // 1. MethodReturn with our unique name
+        // 2. NameAcquired signal for that name
+        // We must consume both to prevent the signal from being forwarded to client,
+        // which would cause "Unexpected message Signal" errors in strict clients like zbus.
+        //
+        // First, read the MethodReturn
         match message::read_message(&mut self.host_bus).await? {
             Some(resp) if resp.header.msg_type == MessageType::MethodReturn => {
-                tracing::debug!("Host bus Hello() succeeded");
-                Ok(())
+                tracing::debug!("Host bus Hello() MethodReturn received");
             }
             Some(resp) if resp.header.msg_type == MessageType::Error => {
                 bail!("Host bus Hello() failed with error")
@@ -206,6 +212,27 @@ impl Session {
             Some(resp) => bail!("Unexpected response to Hello(): {:?}", resp.header.msg_type),
             None => bail!("Host bus disconnected after Hello()"),
         }
+
+        // Then, read the NameAcquired signal
+        match message::read_message(&mut self.host_bus).await? {
+            Some(resp) if resp.header.msg_type == MessageType::Signal => {
+                tracing::debug!(
+                    interface = ?resp.header.interface,
+                    member = ?resp.header.member,
+                    "Consumed NameAcquired signal after Hello()"
+                );
+            }
+            Some(resp) => {
+                tracing::warn!(
+                    msg_type = ?resp.header.msg_type,
+                    "Unexpected second message after Hello(), expected Signal"
+                );
+            }
+            None => bail!("Host bus disconnected after Hello()"),
+        }
+
+        tracing::debug!("Host bus Hello() completed");
+        Ok(())
     }
 
     /// Forward messages between client and upstream buses with routing.

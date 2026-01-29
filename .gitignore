@@ -1,3 +1,8 @@
 /xdg-dbus-proxy
 /target
 config.toml
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

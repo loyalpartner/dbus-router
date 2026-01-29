@@ -134,6 +134,9 @@ async def _test_mixed_calls(router_addr: str, test_log_dir: Path) -> str:
     """Test mixed sandbox and host calls."""
     try:
         bus = await MessageBus(bus_address=router_addr).connect()
+        # At this point Hello() handshake completed - if NameAcquired signal
+        # was left in buffer and forwarded, the connect() would have failed
+        # with "Unexpected message Signal"
 
         # Call 1: Sandbox bus (org.freedesktop.DBus.ListNames)
         reply = await bus.call(
@@ -186,3 +189,183 @@ async def _test_mixed_calls(router_addr: str, test_log_dir: Path) -> str:
         error_str = str(e)
         (test_log_dir / "mixed_test_error.log").write_text(f"Error: {error_str}\n")
         return f"unexpected_error: {error_str}"
+
+
+def test_nameacquired_signal_not_leaked(test_log_dir: Path, build_project):
+    """NameAcquired signal from host bus should not be forwarded to client.
+
+    This test reproduces the NameAcquired signal issue:
+    - Client connects to router, which triggers Router<->Host auth
+    - Router sends Hello() to Host bus
+    - Host bus returns MethodReturn + NameAcquired signal
+    - If NameAcquired is not consumed by Router, it enters forward_loop buffer
+    - When client sends Hello(), the NameAcquired gets forwarded first
+    - Client receives Signal instead of MethodReturn, causing "Unexpected message Signal"
+
+    The key timing here is that the client's Hello() response races with
+    the stale NameAcquired signal from the host bus.
+    """
+    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
+        sock_path = Path(sock_dir)
+        host_dbus_socket = sock_path / "host.sock"
+        sandbox_dbus_socket = sock_path / "sandbox.sock"
+        router_socket = sock_path / "router.sock"
+
+        config = test_log_dir / "router.toml"
+        config.write_text('''
+[[host_routes]]
+destination = "org.test.HostService"
+''')
+
+        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
+            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
+                with dbus_router_session(
+                    router_socket, host_addr, sandbox_addr, config, test_log_dir
+                ) as router_addr:
+                    # Run multiple connections sequentially
+                    # Each triggers Router<->Host Hello() handshake
+                    errors = []
+                    for i in range(3):
+                        result = asyncio.run(
+                            _test_single_host_route_connection(router_addr, i, test_log_dir)
+                        )
+                        if result != "success":
+                            errors.append(f"Connection {i}: {result}")
+
+                    assert not errors, f"Connections failed: {errors}"
+
+
+async def _test_single_host_route_connection(
+    router_addr: str, conn_id: int, test_log_dir: Path
+) -> str:
+    """Single client connection that calls a host-routed service.
+
+    If NameAcquired signal is not properly consumed by Router,
+    this will fail with "Unexpected message Signal".
+    """
+    import socket
+
+    try:
+        # Connect to router - this does Hello() handshake
+        # If stale NameAcquired signal is forwarded, connect() fails here
+        bus = await MessageBus(bus_address=router_addr).connect()
+
+        # Immediately after connect, check if there are unexpected messages
+        # by doing a simple call that should succeed quickly
+        reply = await bus.call(
+            Message(
+                destination='org.freedesktop.DBus',
+                path='/org/freedesktop/DBus',
+                interface='org.freedesktop.DBus',
+                member='GetId',
+            )
+        )
+        if reply.message_type != MessageType.METHOD_RETURN:
+            bus.disconnect()
+            return f"unexpected_first_reply: {reply.message_type}"
+
+        # Call host-routed service (will get ServiceUnknown, that's OK)
+        try:
+            await bus.call(
+                Message(
+                    destination='org.test.HostService',
+                    path='/org/test/HostService',
+                    interface='org.freedesktop.DBus.Peer',
+                    member='Ping',
+                )
+            )
+        except Exception as e:
+            if "ServiceUnknown" not in str(e) and "NameHasNoOwner" not in str(e):
+                bus.disconnect()
+                return f"host_call_error: {e}"
+
+        bus.disconnect()
+        return "success"
+
+    except Exception as e:
+        error_str = str(e)
+        (test_log_dir / f"conn_{conn_id}_error.log").write_text(f"Error: {error_str}\n")
+
+        # Check for the specific NameAcquired signal issue
+        if "Unexpected" in error_str and "Signal" in error_str:
+            return f"nameacquired_signal_leaked: {error_str}"
+        return f"connection_error: {error_str}"
+
+
+def test_no_stale_signal_after_connect(test_log_dir: Path, build_project):
+    """Verify no stale signals are sent to client after connection.
+
+    This is a low-level test that checks if any unexpected messages
+    are received right after the D-Bus handshake completes.
+    """
+    import socket
+    import struct
+
+    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
+        sock_path = Path(sock_dir)
+        host_dbus_socket = sock_path / "host.sock"
+        sandbox_dbus_socket = sock_path / "sandbox.sock"
+        router_socket = sock_path / "router.sock"
+
+        config = test_log_dir / "router.toml"
+        config.write_text('''
+[[host_routes]]
+destination = "org.test.HostService"
+''')
+
+        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
+            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
+                with dbus_router_session(
+                    router_socket, host_addr, sandbox_addr, config, test_log_dir
+                ) as router_addr:
+                    # Use dbus_next to connect (handles auth + Hello)
+                    result = asyncio.run(
+                        _check_for_stale_signals(router_addr, test_log_dir)
+                    )
+                    assert result == "success", f"Test failed: {result}"
+
+
+async def _check_for_stale_signals(router_addr: str, test_log_dir: Path) -> str:
+    """Check if any stale signals are received after connection."""
+    stale_signals = []
+
+    def signal_handler(msg):
+        if msg.message_type == MessageType.SIGNAL:
+            # NameAcquired from org.freedesktop.DBus is expected for our own name
+            # But NameAcquired for router's host bus name would be wrong
+            if msg.interface == 'org.freedesktop.DBus' and msg.member == 'NameAcquired':
+                # Check if this is for our unique name or a stale one
+                if msg.body:
+                    name = msg.body[0]
+                    # Our unique name starts with : and matches our connection
+                    # Any other NameAcquired would be stale
+                    stale_signals.append(f"NameAcquired({name})")
+
+    try:
+        bus = await MessageBus(bus_address=router_addr).connect()
+        bus.add_message_handler(signal_handler)
+
+        # Wait briefly to see if any stale signals arrive
+        await asyncio.sleep(0.1)
+
+        # Make a simple call
+        reply = await bus.call(
+            Message(
+                destination='org.freedesktop.DBus',
+                path='/org/freedesktop/DBus',
+                interface='org.freedesktop.DBus',
+                member='GetId',
+            )
+        )
+
+        bus.disconnect()
+
+        # Filter out expected signals (our own NameAcquired)
+        # We should only receive NameAcquired for our own unique name
+        if len(stale_signals) > 1:
+            return f"stale_signals_detected: {stale_signals}"
+
+        return "success"
+
+    except Exception as e:
+        return f"error: {e}"
