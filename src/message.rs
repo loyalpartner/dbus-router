@@ -317,14 +317,101 @@ fn parse_header_fields(buf: &[u8], endian: Endian) -> Result<ParsedHeaderFields>
                 pos += 4;
             }
             _ => {
-                // Skip other fields - we need to parse based on signature
-                // For simplicity, skip unknown fields by finding next 8-byte boundary
-                pos = align_to(pos, 8);
+                // Skip other fields based on their signature
+                if let Some(new_pos) = skip_field_value(buf, pos, signature, endian) {
+                    pos = new_pos;
+                } else {
+                    // Can't parse, stop processing
+                    break;
+                }
             }
         }
     }
 
     Ok(fields)
+}
+
+/// Skip a field value based on its signature.
+/// Returns the new position after the value, or None if parsing fails.
+fn skip_field_value(buf: &[u8], pos: usize, signature: &[u8], endian: Endian) -> Option<usize> {
+    if signature.is_empty() {
+        return Some(pos);
+    }
+
+    match signature[0] {
+        // STRING or OBJECT_PATH: u32 length + bytes + null (aligned to 4)
+        b's' | b'o' => {
+            let pos = align_to(pos, 4);
+            if pos + 4 > buf.len() {
+                return None;
+            }
+            let str_len = endian.read_u32(&buf[pos..pos + 4]) as usize;
+            let end = pos + 4 + str_len + 1; // +1 for null terminator
+            if end > buf.len() {
+                return None;
+            }
+            Some(end)
+        }
+        // SIGNATURE: u8 length + bytes + null (no alignment needed)
+        b'g' => {
+            if pos >= buf.len() {
+                return None;
+            }
+            let sig_len = buf[pos] as usize;
+            let end = pos + 1 + sig_len + 1; // +1 for length byte, +1 for null
+            if end > buf.len() {
+                return None;
+            }
+            Some(end)
+        }
+        // UINT32: 4 bytes (aligned to 4)
+        b'u' | b'i' | b'b' => {
+            let pos = align_to(pos, 4);
+            if pos + 4 > buf.len() {
+                return None;
+            }
+            Some(pos + 4)
+        }
+        // UINT16 / INT16: 2 bytes (aligned to 2)
+        b'n' | b'q' => {
+            let pos = align_to(pos, 2);
+            if pos + 2 > buf.len() {
+                return None;
+            }
+            Some(pos + 2)
+        }
+        // BYTE: 1 byte (no alignment)
+        b'y' => {
+            if pos >= buf.len() {
+                return None;
+            }
+            Some(pos + 1)
+        }
+        // UINT64 / INT64 / DOUBLE: 8 bytes (aligned to 8)
+        b'x' | b't' | b'd' => {
+            let pos = align_to(pos, 8);
+            if pos + 8 > buf.len() {
+                return None;
+            }
+            Some(pos + 8)
+        }
+        // UNIX_FD: same as u32
+        b'h' => {
+            let pos = align_to(pos, 4);
+            if pos + 4 > buf.len() {
+                return None;
+            }
+            Some(pos + 4)
+        }
+        // Unknown signature - can't skip safely
+        _ => {
+            tracing::warn!(
+                signature = %String::from_utf8_lossy(signature),
+                "Unknown signature in header field, cannot skip"
+            );
+            None
+        }
+    }
 }
 
 /// Align position to the given boundary.
@@ -429,5 +516,88 @@ mod tests {
             raw: vec![],
         };
         assert!(!msg3.is_request_name());
+    }
+
+    #[test]
+    fn test_skip_field_value() {
+        let endian = Endian::Little;
+
+        // Test string (signature "s")
+        // Format: u32 length + bytes + null
+        let mut buf = vec![0, 0, 0, 0]; // padding for alignment
+        buf.extend_from_slice(&5u32.to_le_bytes()); // length = 5
+        buf.extend_from_slice(b"hello\0"); // string + null
+        let result = skip_field_value(&buf, 4, b"s", endian);
+        assert_eq!(result, Some(4 + 4 + 5 + 1)); // aligned pos + len + string + null
+
+        // Test object path (signature "o") - same as string
+        let result = skip_field_value(&buf, 4, b"o", endian);
+        assert_eq!(result, Some(4 + 4 + 5 + 1));
+
+        // Test signature (signature "g")
+        // Format: u8 length + bytes + null
+        let buf = vec![3, b'u', b'u', b's', 0]; // length=3, "uus", null
+        let result = skip_field_value(&buf, 0, b"g", endian);
+        assert_eq!(result, Some(1 + 3 + 1)); // len byte + signature + null
+
+        // Test uint32 (signature "u")
+        let buf = vec![0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12];
+        let result = skip_field_value(&buf, 4, b"u", endian);
+        assert_eq!(result, Some(8));
+
+        // Test byte (signature "y")
+        let buf = vec![42];
+        let result = skip_field_value(&buf, 0, b"y", endian);
+        assert_eq!(result, Some(1));
+    }
+
+    #[test]
+    fn test_parse_header_fields_with_path() {
+        // Simulate header fields with PATH before DESTINATION
+        // PATH (field 1, sig "o") + DESTINATION (field 6, sig "s")
+        let endian = Endian::Little;
+
+        let mut buf = Vec::new();
+
+        // Field 1: PATH (object path "/org/freedesktop/DBus")
+        // Struct alignment (8 bytes) - at position 0, already aligned
+        buf.push(1); // field code: PATH
+        buf.push(1); // signature length
+        buf.push(b'o'); // signature: object path
+        buf.push(0); // null terminator
+
+        // Align to 4 for string length
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        let path = b"/org/freedesktop/DBus";
+        buf.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        buf.extend_from_slice(path);
+        buf.push(0); // null terminator
+
+        // Field 6: DESTINATION (string "org.freedesktop.DBus")
+        // Align to 8 for struct
+        while buf.len() % 8 != 0 {
+            buf.push(0);
+        }
+        buf.push(6); // field code: DESTINATION
+        buf.push(1); // signature length
+        buf.push(b's'); // signature: string
+        buf.push(0); // null terminator
+
+        // Align to 4 for string length
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        let dest = b"org.freedesktop.DBus";
+        buf.extend_from_slice(&(dest.len() as u32).to_le_bytes());
+        buf.extend_from_slice(dest);
+        buf.push(0); // null terminator
+
+        let fields = parse_header_fields(&buf, endian).unwrap();
+        assert_eq!(
+            fields.destination,
+            Some("org.freedesktop.DBus".to_string())
+        );
     }
 }
