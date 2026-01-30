@@ -59,10 +59,10 @@ and identifies missing features that should have integration tests.
 | sender | Yes | Yes | Rewrite fake name to real |
 | interface | Yes | Yes | Standard match |
 | member | Yes | Yes | Standard match |
-| path | Yes | No | Standard match |
+| path | Yes | Yes | Standard match |
 | path_namespace | Unknown | No | Prefix matching |
-| destination | Yes | No | Standard match |
-| argN | Unknown | No | Argument content matching |
+| destination | Yes | Yes | Standard match (with fake name rewrite) |
+| argN | Yes | Yes | arg0 tested, filters by argument content |
 | arg0namespace | Unknown | No | Namespace prefix matching |
 | eavesdrop | Unknown | No | Security implications |
 
@@ -116,11 +116,7 @@ and identifies missing features that should have integration tests.
 
 **Priority 2: Edge Cases**
 
-1. **test_match_rule_path.py** - Test path matching
-   - Add match with specific path
-   - Verify signal filtering
-
-3. **test_no_reply_expected.py** - Test NO_REPLY_EXPECTED flag
+1. **test_no_reply_expected.py** - Test NO_REPLY_EXPECTED flag
    - Send method call with flag
    - Verify no reply is sent
 
