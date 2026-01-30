@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/loyalpartner/dbus-router/compare/v0.6.0...v0.7.0) (2026-01-30)
+
+
+### Features
+
+* improve header field parsing with better type support and debugging ([5e30ccf](https://github.com/loyalpartner/dbus-router/commit/5e30ccf3ff88ba4197b9153e2bc68eb29f67b303))
+
 ## [0.6.0](https://github.com/loyalpartner/dbus-router/compare/v0.5.2...v0.6.0) (2026-01-30)
 
 
