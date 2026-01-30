@@ -53,7 +53,8 @@ pub enum Endian {
 }
 
 impl Endian {
-    fn read_u32(&self, buf: &[u8]) -> u32 {
+    /// Read a u32 from a buffer with the appropriate endianness.
+    pub fn read_u32(&self, buf: &[u8]) -> u32 {
         let arr: [u8; 4] = buf[..4].try_into().unwrap();
         match self {
             Endian::Little => u32::from_le_bytes(arr),
@@ -79,7 +80,7 @@ pub struct MessageHeader {
 }
 
 /// A complete D-Bus message (header + body as raw bytes).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Message {
     pub header: MessageHeader,
     /// Raw message bytes including header and body
@@ -92,6 +93,12 @@ impl Message {
         self.header.destination.as_deref() == Some("org.freedesktop.DBus")
             && self.header.interface.as_deref() == Some("org.freedesktop.DBus")
             && self.header.member.as_deref() == Some("RequestName")
+    }
+
+    /// Extract a simple string from the message body.
+    /// This works for methods where the first argument is a string (AddMatch, etc.)
+    pub fn extract_string_from_body(&self) -> Option<String> {
+        self.extract_name_from_body()
     }
 
     /// Extract the service name from RequestName body.

@@ -103,7 +103,18 @@ def dbus_router_session(
         stderr=stderr,
         env=env,
     )
-    time.sleep(0.5)
+    # Wait for router to start and create socket
+    for _ in range(20):  # up to 2 seconds
+        time.sleep(0.1)
+        if listen_path.exists():
+            break
+    if not listen_path.exists():
+        # Check if process is still alive
+        poll_result = proc.poll()
+        raise RuntimeError(
+            f"Router socket not created at {listen_path}. "
+            f"Process poll: {poll_result}"
+        )
     try:
         yield f"unix:path={listen_path}"
     finally:
