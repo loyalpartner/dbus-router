@@ -93,12 +93,12 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
         let sig_len = raw[pos] as usize;
         pos += 1 + sig_len + 1; // length byte + signature + null terminator
 
-        // Align to the variant value alignment
-        // For strings (signature 's'), alignment is 4
-        let value_align = if sig_len == 1 && pos > 2 && raw[pos - sig_len - 1] == b's' {
-            4
-        } else {
-            1
+        // Align to the variant value alignment based on type
+        let sig_byte = if sig_len == 1 { raw[pos - sig_len - 1] } else { 0 };
+        let value_align = match sig_byte {
+            b's' | b'o' | b'u' => 4, // strings and uint32 have 4-byte alignment
+            b'g' => 1,               // signature has 1-byte alignment
+            _ => 1,
         };
         pos = (pos + value_align - 1) & !(value_align - 1);
 
@@ -128,31 +128,72 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
             let new_field_size = new_str_data.len();
             let size_diff = new_field_size as isize - old_field_size as isize;
 
-            // Replace the string in the raw buffer
-            let mut new_raw = Vec::with_capacity((raw.len() as isize + size_diff) as usize);
-            new_raw.extend_from_slice(&raw[..pos]);
-            new_raw.extend_from_slice(&new_str_data);
-            new_raw.extend_from_slice(&raw[old_str_end..]);
+            // Calculate new array length
+            let new_array_len = (array_len as isize + size_diff) as usize;
+            let new_fields_end = fields_start + new_array_len;
 
-            // Update array length in header
-            let new_array_len = (array_len as isize + size_diff) as u32;
+            // Calculate old and new padding
+            let old_header_end = fields_end;
+            let old_padding = (8 - (old_header_end % 8)) % 8;
+            let old_body_start = old_header_end + old_padding;
+
+            let new_padding = (8 - (new_fields_end % 8)) % 8;
+
+            // Replace the string and reconstruct the message with correct padding
+            let mut new_raw = Vec::with_capacity(raw.len());
+
+            // Fixed header (12 bytes)
+            new_raw.extend_from_slice(&raw[..12]);
+
+            // New array length (4 bytes)
             let array_len_bytes = match endian {
-                Endian::Little => new_array_len.to_le_bytes(),
-                Endian::Big => new_array_len.to_be_bytes(),
+                Endian::Little => (new_array_len as u32).to_le_bytes(),
+                Endian::Big => (new_array_len as u32).to_be_bytes(),
             };
-            new_raw[12..16].copy_from_slice(&array_len_bytes);
+            new_raw.extend_from_slice(&array_len_bytes);
+
+            // Header fields: everything before the string we're replacing
+            new_raw.extend_from_slice(&raw[fields_start..pos]);
+
+            // New string data
+            new_raw.extend_from_slice(&new_str_data);
+
+            // Rest of header fields (after the old string)
+            new_raw.extend_from_slice(&raw[old_str_end..old_header_end]);
+
+            // New padding
+            new_raw.resize(new_raw.len() + new_padding, 0);
+
+            // Body (everything after old padding)
+            new_raw.extend_from_slice(&raw[old_body_start..]);
 
             *raw = new_raw;
             return Ok(());
         }
 
-        // Skip the value
-        // For strings: 4 bytes length + string + null
-        if pos + 4 > fields_end {
-            break;
+        // Skip the value based on the signature type
+        // Check signature type to determine how to skip
+        let sig_byte = if sig_len == 1 { raw[pos - sig_len - 1] } else { 0 };
+
+        match sig_byte {
+            b's' | b'o' | b'g' => {
+                // String types: 4 bytes length + string + null
+                if pos + 4 > fields_end {
+                    break;
+                }
+                let value_len = endian.read_u32(&raw[pos..]) as usize;
+                pos += 4 + value_len + 1;
+            }
+            b'u' => {
+                // uint32: 4 bytes
+                pos += 4;
+            }
+            _ => {
+                // Unknown type, can't safely skip
+                tracing::warn!(sig_byte = sig_byte, "Unknown header field type, cannot parse");
+                break;
+            }
         }
-        let value_len = endian.read_u32(&raw[pos..]) as usize;
-        pos += 4 + value_len + 1;
     }
 
     // Field not found - this is OK, not all messages have all fields
