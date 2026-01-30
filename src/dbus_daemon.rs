@@ -26,6 +26,7 @@ pub const METHODS_NEED_REQUEST_REWRITE: &[&str] = &[
     "GetConnectionUnixProcessID",
     "GetConnectionSELinuxSecurityContext",
     "GetAdtAuditSessionData",
+    "NameHasOwner",
 ];
 
 /// Methods that need result merging from both buses

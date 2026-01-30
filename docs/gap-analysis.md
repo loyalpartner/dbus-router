@@ -16,7 +16,7 @@ and identifies missing features that should have integration tests.
 | ReleaseName | Yes | Yes | Routing and signal handling verified |
 | ListNames | Yes | Yes | Merges both buses with fake prefixes |
 | ListActivatableNames | Yes | Yes | Same merge logic as ListNames |
-| NameHasOwner | Yes | Yes | Routes based on name prefix (see limitations) |
+| NameHasOwner | Yes | Yes | Rewrites unique name in request body |
 | GetNameOwner | Yes | Yes | Rewrites unique name in response |
 | StartServiceByName | Yes | Yes | Routes based on service name |
 | ListQueuedOwners | Routing only | No | Returns unique names - need rewrite |
@@ -137,16 +137,6 @@ and identifies missing features that should have integration tests.
 6. **test_large_message.py** - Message size limits
 
 ## Known Limitations
-
-### NameHasOwner with Fake Unique Names
-
-`NameHasOwner` for fake unique names (e.g., `:s.1.0`) doesn't work correctly.
-The router routes to the correct bus but doesn't rewrite the body argument,
-so the underlying bus returns False (doesn't recognize the fake name).
-
-**Workaround:** Use well-known names for NameHasOwner queries.
-
-**Fix:** Add `NameHasOwner` to `METHODS_NEED_REQUEST_REWRITE` in `dbus_daemon.rs`.
 
 ### Credential Queries Return Proxy Credentials
 
