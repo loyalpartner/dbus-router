@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/loyalpartner/dbus-router/compare/v0.7.0...v0.8.0) (2026-01-30)
+
+
+### Features
+
+* add message context to header rewrite debug logs ([0f0582a](https://github.com/loyalpartner/dbus-router/commit/0f0582a5259b1af1d6e5c688db1bd105086174b5))
+
+
+### Bug Fixes
+
+* hostpass clients survive sandbox bus disconnection ([e687876](https://github.com/loyalpartner/dbus-router/commit/e6878768428a186c5106d8cbd7d9be74e247e72e))
+
 ## [0.7.0](https://github.com/loyalpartner/dbus-router/compare/v0.6.0...v0.7.0) (2026-01-30)
 
 
