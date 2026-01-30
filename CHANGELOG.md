@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/loyalpartner/dbus-router/compare/v0.5.2...v0.6.0) (2026-01-30)
+
+
+### Features
+
+* implement smart signal routing with fake unique name support ([#14](https://github.com/loyalpartner/dbus-router/issues/14)) ([972a8cf](https://github.com/loyalpartner/dbus-router/commit/972a8cf40b57577c1d3e6aa92b870591e7e6c32c))
+
 ## [0.5.2](https://github.com/loyalpartner/dbus-router/compare/v0.5.1...v0.5.2) (2026-01-29)
 
 
