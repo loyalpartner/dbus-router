@@ -22,7 +22,11 @@ pub enum RewriteDirection {
 /// Rewrite a message's header fields (sender, destination) for fake name transformation.
 ///
 /// This modifies the raw bytes of the message in place.
-pub fn rewrite_message_header(msg: &mut Message, direction: RewriteDirection, source_bus: Bus) -> Result<()> {
+pub fn rewrite_message_header(
+    msg: &mut Message,
+    direction: RewriteDirection,
+    source_bus: Bus,
+) -> Result<()> {
     // For ToClient: transform sender from real to fake
     // For ToUpstream: transform destination from fake to real
 
@@ -81,7 +85,12 @@ pub fn rewrite_message_header(msg: &mut Message, direction: RewriteDirection, so
 /// - 7: SENDER
 /// - 8: SIGNATURE
 /// - 9: UNIX_FDS
-fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_value: &str) -> Result<()> {
+fn rewrite_header_field(
+    raw: &mut Vec<u8>,
+    endian: Endian,
+    field_code: u8,
+    new_value: &str,
+) -> Result<()> {
     // Parse the header to find the field location
     let array_len = endian.read_u32(&raw[12..]) as usize;
     let fields_start = 16;
@@ -123,7 +132,11 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
 
         // Align to the variant value alignment based on type
         // Read the first byte of the signature (for type determination)
-        let sig_byte = if sig_len > 0 { raw[pos - sig_len - 1] } else { 0 };
+        let sig_byte = if sig_len > 0 {
+            raw[pos - sig_len - 1]
+        } else {
+            0
+        };
 
         tracing::trace!(
             field_index = field_index,
@@ -137,12 +150,12 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
         field_index += 1;
         let value_align = match sig_byte {
             b's' | b'o' | b'u' | b'i' | b'b' | b'h' => 4, // strings, uint32, int32, boolean, fd: 4-byte alignment
-            b'n' | b'q' => 2,        // int16, uint16: 2-byte alignment
-            b'x' | b't' | b'd' => 8, // int64, uint64, double: 8-byte alignment
-            b'g' | b'y' => 1,        // signature, byte: 1-byte alignment
-            b'a' => 4,               // array: 4-byte alignment (for length prefix)
-            b'v' => 1,               // variant: 1-byte alignment (for signature length)
-            b'(' | b'{' => 8,        // struct, dict_entry: 8-byte alignment
+            b'n' | b'q' => 2,                             // int16, uint16: 2-byte alignment
+            b'x' | b't' | b'd' => 8,                      // int64, uint64, double: 8-byte alignment
+            b'g' | b'y' => 1,                             // signature, byte: 1-byte alignment
+            b'a' => 4,        // array: 4-byte alignment (for length prefix)
+            b'v' => 1,        // variant: 1-byte alignment (for signature length)
+            b'(' | b'{' => 8, // struct, dict_entry: 8-byte alignment
             _ => 1,
         };
         pos = (pos + value_align - 1) & !(value_align - 1);
@@ -245,7 +258,11 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
 
         // Skip the value based on the signature type
         // Read the first byte of the signature (for type determination)
-        let sig_byte = if sig_len > 0 { raw[pos - sig_len - 1] } else { 0 };
+        let sig_byte = if sig_len > 0 {
+            raw[pos - sig_len - 1]
+        } else {
+            0
+        };
 
         match sig_byte {
             b's' | b'o' => {
@@ -300,7 +317,7 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
                 }
                 let vsig_byte = if vsig_len > 0 { raw[pos + 1] } else { 0 };
                 pos += 1 + vsig_len + 1; // skip signature
-                // Align and skip the variant value based on its type
+                                         // Align and skip the variant value based on its type
                 let v_align = match vsig_byte {
                     b's' | b'o' | b'u' | b'i' | b'b' | b'h' | b'a' => 4,
                     b'n' | b'q' => 2,
@@ -312,12 +329,16 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
                 // Skip value (simplified: only handle basic types inside variant)
                 match vsig_byte {
                     b's' | b'o' => {
-                        if pos + 4 > fields_end { break; }
+                        if pos + 4 > fields_end {
+                            break;
+                        }
                         let vlen = endian.read_u32(&raw[pos..]) as usize;
                         pos += 4 + vlen + 1;
                     }
                     b'g' => {
-                        if pos >= fields_end { break; }
+                        if pos >= fields_end {
+                            break;
+                        }
                         let vlen = raw[pos] as usize;
                         pos += 1 + vlen + 1;
                     }
@@ -327,7 +348,10 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
                     b'y' => pos += 1,
                     _ => {
                         // Nested complex type in variant, can't skip
-                        tracing::trace!(vsig_byte = vsig_byte, "Cannot skip nested complex type in variant");
+                        tracing::trace!(
+                            vsig_byte = vsig_byte,
+                            "Cannot skip nested complex type in variant"
+                        );
                         break;
                     }
                 }
@@ -507,7 +531,10 @@ mod tests {
     fn test_rewrite_match_rule_sender() {
         let rule = "type='signal',sender=':1.45',interface='org.test'";
         let rewritten = rewrite_match_rule_sender(rule, ":1.45", ":h.1.45");
-        assert_eq!(rewritten, "type='signal',sender=':h.1.45',interface='org.test'");
+        assert_eq!(
+            rewritten,
+            "type='signal',sender=':h.1.45',interface='org.test'"
+        );
     }
 
     #[test]
@@ -517,7 +544,10 @@ mod tests {
 
         assert_eq!(info.msg_type, Some("signal".to_string()));
         assert_eq!(info.sender, Some("org.fcitx.Fcitx5".to_string()));
-        assert_eq!(info.interface, Some("org.fcitx.Fcitx5.Controller1".to_string()));
+        assert_eq!(
+            info.interface,
+            Some("org.fcitx.Fcitx5.Controller1".to_string())
+        );
         assert_eq!(info.member, Some("CurrentInputMethodChanged".to_string()));
         assert_eq!(info.path, Some("/controller".to_string()));
     }
@@ -536,7 +566,10 @@ mod tests {
         // Test rewriting match rule with fake unique name
         let rule = "type='signal',sender=':h.1.45',interface='org.test'";
         let rewritten = rewrite_match_rule_sender(rule, ":h.1.45", ":1.45");
-        assert_eq!(rewritten, "type='signal',sender=':1.45',interface='org.test'");
+        assert_eq!(
+            rewritten,
+            "type='signal',sender=':1.45',interface='org.test'"
+        );
 
         // Test with sandbox prefix
         let rule = "type='signal',sender=':s.1.23',member='Test'";
@@ -562,10 +595,10 @@ mod tests {
         // Build a minimal D-Bus message with sender ":1.45"
         // Format: fixed header (12 bytes) + array length (4 bytes) + header fields + padding + body
         let mut raw = vec![
-            b'l',  // Little endian
-            1,     // METHOD_CALL
-            0,     // flags
-            1,     // protocol version
+            b'l', // Little endian
+            1,    // METHOD_CALL
+            0,    // flags
+            1,    // protocol version
             0, 0, 0, 0, // body length (0)
             1, 0, 0, 0, // serial (1)
         ];
@@ -625,10 +658,10 @@ mod tests {
 
         // Build a minimal D-Bus message with destination ":h.1.45"
         let mut raw = vec![
-            b'l',  // Little endian
-            1,     // METHOD_CALL
-            0,     // flags
-            1,     // protocol version
+            b'l', // Little endian
+            1,    // METHOD_CALL
+            0,    // flags
+            1,    // protocol version
             0, 0, 0, 0, // body length (0)
             1, 0, 0, 0, // serial (1)
         ];

@@ -3,10 +3,10 @@
 use crate::auth;
 use crate::config::Config;
 use crate::dbus_daemon::{
-    build_list_names_response, merge_list_names, needs_request_rewrite,
-    needs_response_rewrite, parse_string_array, rewrite_match_rule_body,
-    rewrite_name_owner_changed, rewrite_single_name_response, rewrite_string_array_response,
-    rewrite_unique_name_request, signal_needs_rewrite,
+    build_list_names_response, merge_list_names, needs_request_rewrite, needs_response_rewrite,
+    parse_string_array, rewrite_match_rule_body, rewrite_name_owner_changed,
+    rewrite_single_name_response, rewrite_string_array_response, rewrite_unique_name_request,
+    signal_needs_rewrite,
 };
 use crate::fake_name::get_bus_from_fake_name;
 use crate::message::{self, read_message, Message, MessageType};
@@ -91,11 +91,9 @@ fn prepare_message_for_client(
     );
 
     // Rewrite sender header to add bus prefix
-    if let Err(e) = rewrite_message_header(
-        &mut msg_for_client,
-        RewriteDirection::ToClient,
-        source_bus,
-    ) {
+    if let Err(e) =
+        rewrite_message_header(&mut msg_for_client, RewriteDirection::ToClient, source_bus)
+    {
         tracing::warn!(
             error = %e,
             msg_type = ?msg.header.msg_type,
@@ -224,7 +222,11 @@ fn process_merge_response(
     };
 
     let merged = merge_list_names(host_names, sandbox_names);
-    tracing::trace!(serial = reply_serial, count = merged.len(), "Merged ListNames response");
+    tracing::trace!(
+        serial = reply_serial,
+        count = merged.len(),
+        "Merged ListNames response"
+    );
 
     let pending = pending_merges.remove(&reply_serial).unwrap();
     let response = match build_list_names_response(&pending.original_request, merged) {
@@ -498,6 +500,13 @@ impl Session {
 
     /// Forward messages between client and upstream buses with routing.
     async fn forward_loop(mut self) -> Result<()> {
+        // Check if this is a hostpass client (they only use host bus)
+        let is_hostpass = self
+            .client_exe_path
+            .as_ref()
+            .map(|p| self.config.has_hostpass(p))
+            .unwrap_or(false);
+
         let (client_read, mut client_write) = self.client.split();
         let (host_read, mut host_write) = self.host_bus.split();
         let (sandbox_read, mut sandbox_write) = self.sandbox_bus.split();
@@ -506,8 +515,12 @@ impl Session {
         let mut host_read = tokio::io::BufReader::new(host_read);
         let mut sandbox_read = tokio::io::BufReader::new(sandbox_read);
 
+        // Track if sandbox bus is still active (for hostpass clients that survive sandbox disconnect)
+        let mut sandbox_active = true;
+
         loop {
             tokio::select! {
+                biased;
                 // Read from client and route to appropriate bus
                 result = read_message(&mut client_read) => {
                     match result {
@@ -730,7 +743,7 @@ impl Session {
                 }
 
                 // Read from sandbox bus and forward to client
-                result = read_message(&mut sandbox_read) => {
+                result = read_message(&mut sandbox_read), if sandbox_active => {
                     match result {
                         Ok(Some(msg)) => {
                             // Check if this is a response to a pending merge request
@@ -773,10 +786,21 @@ impl Session {
                         }
                         Ok(None) => {
                             tracing::debug!("Sandbox bus disconnected");
+                            if is_hostpass {
+                                // Hostpass clients only use host bus, so they can continue
+                                tracing::info!("Hostpass client continues after sandbox disconnect");
+                                sandbox_active = false;
+                                continue;
+                            }
                             return Ok(());
                         }
                         Err(e) => {
                             tracing::debug!(error = %e, "Error reading from sandbox bus");
+                            if is_hostpass {
+                                tracing::info!("Hostpass client continues after sandbox read error");
+                                sandbox_active = false;
+                                continue;
+                            }
                             return Ok(());
                         }
                     }
@@ -959,7 +983,11 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
 
         // ListNames/ListActivatableNames: merge results from both buses
         "ListNames" | "ListActivatableNames" => {
-            tracing::trace!(member = member, "Routing {} to both buses for merge", member);
+            tracing::trace!(
+                member = member,
+                "Routing {} to both buses for merge",
+                member
+            );
             RouteDecision::Merge
         }
 

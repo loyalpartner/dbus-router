@@ -10,14 +10,13 @@ use crate::message::{Endian, Message};
 use crate::message_rewrite::{parse_match_rule_sender, rewrite_match_rule_sender};
 use crate::session::Bus;
 use anyhow::{bail, Result};
-use zvariant::{serialized::{Context, Data}, to_bytes, Endian as ZEndian, LE, BE};
+use zvariant::{
+    serialized::{Context, Data},
+    to_bytes, Endian as ZEndian, BE, LE,
+};
 
 /// Methods that need response rewriting (unique name in return value)
-pub const METHODS_NEED_RESPONSE_REWRITE: &[&str] = &[
-    "Hello",
-    "GetNameOwner",
-    "ListQueuedOwners",
-];
+pub const METHODS_NEED_RESPONSE_REWRITE: &[&str] = &["Hello", "GetNameOwner", "ListQueuedOwners"];
 
 /// Methods that need request rewriting (unique name in argument)
 pub const METHODS_NEED_REQUEST_REWRITE: &[&str] = &[
@@ -30,15 +29,10 @@ pub const METHODS_NEED_REQUEST_REWRITE: &[&str] = &[
 ];
 
 /// Methods that need result merging from both buses
-pub const METHODS_NEED_MERGE: &[&str] = &[
-    "ListNames",
-    "ListActivatableNames",
-];
+pub const METHODS_NEED_MERGE: &[&str] = &["ListNames", "ListActivatableNames"];
 
 /// Signals that need body rewriting
-pub const SIGNALS_NEED_REWRITE: &[&str] = &[
-    "NameOwnerChanged",
-];
+pub const SIGNALS_NEED_REWRITE: &[&str] = &["NameOwnerChanged"];
 
 /// Check if a method needs response rewriting
 pub fn needs_response_rewrite(member: &str) -> bool {
@@ -183,7 +177,8 @@ pub fn rewrite_unique_name_request(msg: &Message) -> Result<(Vec<u8>, Bus)> {
 
     // Check if it's a fake unique name
     if let Some((real_name, bus)) = from_fake_name(&name) {
-        let new_raw = rebuild_message_with_string(&msg.raw, msg.header.endian, body_start, &real_name)?;
+        let new_raw =
+            rebuild_message_with_string(&msg.raw, msg.header.endian, body_start, &real_name)?;
         Ok((new_raw, bus))
     } else {
         // Not a fake name, return original
@@ -244,13 +239,14 @@ pub fn rewrite_name_owner_changed(msg: &Message, source: Bus) -> Result<Vec<u8>>
     let body_data = &msg.raw[body_start..];
     let data = Data::new(body_data, ctxt);
 
-    let (name, old_owner, new_owner): (String, String, String) = match data.deserialize::<(String, String, String)>() {
-        Ok((tuple, _)) => tuple,
-        Err(e) => {
-            tracing::warn!("Failed to parse NameOwnerChanged: {}", e);
-            return Ok(msg.raw.clone());
-        }
-    };
+    let (name, old_owner, new_owner): (String, String, String) =
+        match data.deserialize::<(String, String, String)>() {
+            Ok((tuple, _)) => tuple,
+            Err(e) => {
+                tracing::warn!("Failed to parse NameOwnerChanged: {}", e);
+                return Ok(msg.raw.clone());
+            }
+        };
 
     // Rewrite unique names in old_owner and new_owner
     let new_old_owner = if is_unique_name(&old_owner) && !old_owner.is_empty() {
@@ -267,8 +263,14 @@ pub fn rewrite_name_owner_changed(msg: &Message, source: Bus) -> Result<Vec<u8>>
 
     // Serialize the new body
     let new_body = match msg.header.endian {
-        Endian::Little => to_bytes(Context::new_dbus(LE, 0), &(name, new_old_owner, new_new_owner))?,
-        Endian::Big => to_bytes(Context::new_dbus(BE, 0), &(name, new_old_owner, new_new_owner))?,
+        Endian::Little => to_bytes(
+            Context::new_dbus(LE, 0),
+            &(name, new_old_owner, new_new_owner),
+        )?,
+        Endian::Big => to_bytes(
+            Context::new_dbus(BE, 0),
+            &(name, new_old_owner, new_new_owner),
+        )?,
     };
 
     rebuild_message_with_body(&msg.raw, msg.header.endian, &new_body)
@@ -284,7 +286,12 @@ fn get_body_start(raw: &[u8], endian: Endian) -> usize {
 }
 
 /// Rebuild a message with a new string in the body
-fn rebuild_message_with_string(raw: &[u8], endian: Endian, _body_start: usize, new_str: &str) -> Result<Vec<u8>> {
+fn rebuild_message_with_string(
+    raw: &[u8],
+    endian: Endian,
+    _body_start: usize,
+    new_str: &str,
+) -> Result<Vec<u8>> {
     let new_len = new_str.len() as u32;
     let new_len_bytes = match endian {
         Endian::Little => new_len.to_le_bytes(),
@@ -337,7 +344,8 @@ pub fn parse_string_array(msg: &Message) -> Result<Vec<String>> {
     let body_data = &msg.raw[body_start..];
     let data = Data::new(body_data, ctxt);
 
-    let names: Vec<String> = data.deserialize::<Vec<String>>()
+    let names: Vec<String> = data
+        .deserialize::<Vec<String>>()
         .map(|(names, _)| names)
         .unwrap_or_default();
 
@@ -452,7 +460,13 @@ mod tests {
         assert!(merged.contains(&":h.1.45".to_string()));
 
         // org.freedesktop.DBus should only appear once
-        assert_eq!(merged.iter().filter(|n| *n == "org.freedesktop.DBus").count(), 1);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|n| *n == "org.freedesktop.DBus")
+                .count(),
+            1
+        );
     }
 
     #[test]
