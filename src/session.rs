@@ -33,7 +33,7 @@ fn log_message(msg: &Message, direction: &str, target: Option<Bus>) {
         None => "",
     };
 
-    tracing::debug!(
+    tracing::trace!(
         direction = direction,
         target = target_str,
         msg_type = ?msg.header.msg_type,
@@ -68,6 +68,148 @@ fn format_message_summary(msg: &Message) -> String {
         "{} {}.{} [{}->{}] serial={}",
         type_str, interface, member, sender, dest, msg.header.serial
     )
+}
+
+/// Prepare a message from an upstream bus for forwarding to the client.
+/// Rewrites sender header and body as needed.
+fn prepare_message_for_client(
+    msg: &Message,
+    source_bus: Bus,
+    pending_calls: &HashMap<u32, PendingCallInfo>,
+) -> Vec<u8> {
+    let mut msg_for_client = msg.clone();
+
+    // Rewrite sender header to add bus prefix
+    if let Err(e) = rewrite_message_header(
+        &mut msg_for_client,
+        RewriteDirection::ToClient,
+        source_bus,
+    ) {
+        tracing::warn!(error = %e, "Failed to rewrite sender header");
+    }
+
+    // Handle body rewriting based on message type
+    match msg_for_client.header.msg_type {
+        MessageType::MethodReturn => {
+            rewrite_method_return_body(&msg_for_client, source_bus, pending_calls)
+        }
+        MessageType::Signal => rewrite_signal_body(&msg_for_client, source_bus),
+        _ => msg_for_client.raw,
+    }
+}
+
+/// Rewrite method return body if it contains unique names that need prefixing.
+fn rewrite_method_return_body(
+    msg: &Message,
+    source_bus: Bus,
+    pending_calls: &HashMap<u32, PendingCallInfo>,
+) -> Vec<u8> {
+    let Some(reply_serial) = msg.header.reply_serial else {
+        return msg.raw.clone();
+    };
+
+    let Some(call_info) = pending_calls.get(&reply_serial) else {
+        return msg.raw.clone();
+    };
+
+    if call_info.bus != source_bus {
+        return msg.raw.clone();
+    }
+
+    let Some(ref member) = call_info.member else {
+        return msg.raw.clone();
+    };
+
+    if !needs_response_rewrite(member) {
+        return msg.raw.clone();
+    }
+
+    match rewrite_single_name_response(msg, source_bus) {
+        Ok(rewritten) => {
+            tracing::trace!(member = member, bus = ?source_bus, "Rewrote response body");
+            rewritten
+        }
+        Err(e) => {
+            tracing::warn!(member = member, error = %e, "Failed to rewrite response body");
+            msg.raw.clone()
+        }
+    }
+}
+
+/// Rewrite signal body if it contains unique names that need prefixing.
+fn rewrite_signal_body(msg: &Message, source_bus: Bus) -> Vec<u8> {
+    let Some(ref member) = msg.header.member else {
+        return msg.raw.clone();
+    };
+
+    if !signal_needs_rewrite(member) {
+        return msg.raw.clone();
+    }
+
+    match rewrite_name_owner_changed(msg, source_bus) {
+        Ok(rewritten) => {
+            tracing::trace!(member = member, bus = ?source_bus, "Rewrote signal body");
+            rewritten
+        }
+        Err(e) => {
+            tracing::warn!(member = member, error = %e, "Failed to rewrite signal body");
+            msg.raw.clone()
+        }
+    }
+}
+
+/// Result of processing a merge response.
+enum MergeResult {
+    /// First response stored, waiting for second
+    Stored,
+    /// Second response received, returns merged message bytes
+    Complete(Vec<u8>),
+}
+
+/// Process a ListNames/ListActivatableNames merge response.
+/// Returns `Some(MergeResult)` if the message was a merge response, `None` otherwise.
+fn process_merge_response(
+    msg: &Message,
+    source_bus: Bus,
+    pending_merges: &mut HashMap<u32, PendingMerge>,
+) -> Option<MergeResult> {
+    let reply_serial = msg.header.reply_serial?;
+    let pending = pending_merges.get_mut(&reply_serial)?;
+
+    let names = parse_string_array(msg).unwrap_or_default();
+    tracing::trace!(
+        serial = reply_serial,
+        count = names.len(),
+        bus = ?source_bus,
+        "Received ListNames response"
+    );
+
+    let Some((first_bus, first_names)) = pending.first_response.take() else {
+        // First response - store it
+        pending.first_response = Some((source_bus, names));
+        return Some(MergeResult::Stored);
+    };
+
+    // Second response - merge and build final message
+    let (host_names, sandbox_names) = if first_bus == Bus::Host {
+        (first_names, names)
+    } else {
+        (names, first_names)
+    };
+
+    let merged = merge_list_names(host_names, sandbox_names);
+    tracing::trace!(serial = reply_serial, count = merged.len(), "Merged ListNames response");
+
+    let pending = pending_merges.remove(&reply_serial).unwrap();
+    let response = match build_list_names_response(&pending.original_request, merged) {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to build merged response");
+            msg.raw.clone()
+        }
+    };
+
+    Some(MergeResult::Complete(response))
 }
 
 /// Pending merge state for ListNames/ListActivatableNames
@@ -413,7 +555,7 @@ impl Session {
                                                 // Rewrite unique name in body (GetConnectionCredentials etc.)
                                                 match rewrite_unique_name_request(&msg_for_upstream) {
                                                     Ok((rewritten, _bus)) => {
-                                                        tracing::debug!(
+                                                        tracing::trace!(
                                                             member = member,
                                                             "Rewrote request body to remove fake prefix"
                                                         );
@@ -432,7 +574,7 @@ impl Session {
                                                 // Rewrite sender in match rule
                                                 match rewrite_match_rule_body(&msg_for_upstream) {
                                                     Ok(Some(rewritten)) => {
-                                                        tracing::debug!(
+                                                        tracing::trace!(
                                                             member = member,
                                                             "Rewrote match rule sender"
                                                         );
@@ -535,131 +677,18 @@ impl Session {
                             }
 
                             // Check if this is a response to a pending merge request
-                            if let Some(reply_serial) = msg.header.reply_serial {
-                                if let Some(pending) = self.pending_merges.get_mut(&reply_serial) {
-                                    let names = parse_string_array(&msg).unwrap_or_default();
-                                    tracing::debug!(
-                                        serial = reply_serial,
-                                        count = names.len(),
-                                        "Received host ListNames response"
-                                    );
-
-                                    if let Some((first_bus, first_names)) = pending.first_response.take() {
-                                        // This is the second response - merge and send
-                                        let (host_names, sandbox_names) = if first_bus == Bus::Host {
-                                            (first_names, names)
-                                        } else {
-                                            (names, first_names)
-                                        };
-
-                                        let merged = merge_list_names(host_names, sandbox_names);
-                                        tracing::debug!(
-                                            serial = reply_serial,
-                                            count = merged.len(),
-                                            "Merged ListNames response"
-                                        );
-
-                                        let pending = self.pending_merges.remove(&reply_serial).unwrap();
-                                        match build_list_names_response(&pending.original_request, merged) {
-                                            Ok(response) => {
-                                                client_write.write_all(&response).await?;
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "Failed to build merged response");
-                                                client_write.write_all(&msg.raw).await?;
-                                            }
-                                        }
-                                    } else {
-                                        // This is the first response - store it
-                                        pending.first_response = Some((Bus::Host, names));
-                                    }
-                                    continue;
+                            if let Some(result) = process_merge_response(&msg, Bus::Host, &mut self.pending_merges) {
+                                if let MergeResult::Complete(response) = result {
+                                    client_write.write_all(&response).await?;
                                 }
+                                continue;
                             }
 
-                            // Prepare message for client: rewrite sender header and body
-                            let mut msg_for_client = msg.clone();
-
-                            // 1. Rewrite sender header to add :h. prefix
-                            if let Err(e) = rewrite_message_header(
-                                &mut msg_for_client,
-                                RewriteDirection::ToClient,
+                            let msg_to_send = prepare_message_for_client(
+                                &msg,
                                 Bus::Host,
-                            ) {
-                                tracing::warn!(error = %e, "Failed to rewrite sender header");
-                            }
-
-                            // 2. Handle body rewriting (for specific methods/signals)
-                            let msg_to_send = if msg_for_client.header.msg_type == MessageType::MethodReturn {
-                                if let Some(reply_serial) = msg_for_client.header.reply_serial {
-                                    if let Some(call_info) = self.pending_calls.get(&reply_serial) {
-                                        if call_info.bus == Bus::Host {
-                                            // This is a response from host bus
-                                            if let Some(ref member) = call_info.member {
-                                                if needs_response_rewrite(member) {
-                                                    match rewrite_single_name_response(&msg_for_client, Bus::Host) {
-                                                        Ok(rewritten) => {
-                                                            tracing::debug!(
-                                                                member = member,
-                                                                "Rewrote host response body with :h. prefix"
-                                                            );
-                                                            rewritten
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                member = member,
-                                                                error = %e,
-                                                                "Failed to rewrite host response body"
-                                                            );
-                                                            msg_for_client.raw.clone()
-                                                        }
-                                                    }
-                                                } else {
-                                                    msg_for_client.raw.clone()
-                                                }
-                                            } else {
-                                                msg_for_client.raw.clone()
-                                            }
-                                        } else {
-                                            msg_for_client.raw.clone()
-                                        }
-                                    } else {
-                                        msg_for_client.raw.clone()
-                                    }
-                                } else {
-                                    msg_for_client.raw.clone()
-                                }
-                            } else if msg_for_client.header.msg_type == MessageType::Signal {
-                                // Handle signal rewriting (NameOwnerChanged)
-                                if let Some(ref member) = msg_for_client.header.member {
-                                    if signal_needs_rewrite(member) {
-                                        match rewrite_name_owner_changed(&msg_for_client, Bus::Host) {
-                                            Ok(rewritten) => {
-                                                tracing::debug!(
-                                                    member = member,
-                                                    "Rewrote host signal body with :h. prefix"
-                                                );
-                                                rewritten
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    member = member,
-                                                    error = %e,
-                                                    "Failed to rewrite host signal body"
-                                                );
-                                                msg_for_client.raw.clone()
-                                            }
-                                        }
-                                    } else {
-                                        msg_for_client.raw.clone()
-                                    }
-                                } else {
-                                    msg_for_client.raw.clone()
-                                }
-                            } else {
-                                msg_for_client.raw.clone()
-                            };
-
+                                &self.pending_calls,
+                            );
                             log_message(&msg, "Host->Client", None);
                             client_write.write_all(&msg_to_send).await?;
                         }
@@ -679,46 +708,11 @@ impl Session {
                     match result {
                         Ok(Some(msg)) => {
                             // Check if this is a response to a pending merge request
-                            if let Some(reply_serial) = msg.header.reply_serial {
-                                if let Some(pending) = self.pending_merges.get_mut(&reply_serial) {
-                                    let names = parse_string_array(&msg).unwrap_or_default();
-                                    tracing::debug!(
-                                        serial = reply_serial,
-                                        count = names.len(),
-                                        "Received sandbox ListNames response"
-                                    );
-
-                                    if let Some((first_bus, first_names)) = pending.first_response.take() {
-                                        // This is the second response - merge and send
-                                        let (host_names, sandbox_names) = if first_bus == Bus::Host {
-                                            (first_names, names)
-                                        } else {
-                                            (names, first_names)
-                                        };
-
-                                        let merged = merge_list_names(host_names, sandbox_names);
-                                        tracing::debug!(
-                                            serial = reply_serial,
-                                            count = merged.len(),
-                                            "Merged ListNames response"
-                                        );
-
-                                        let pending = self.pending_merges.remove(&reply_serial).unwrap();
-                                        match build_list_names_response(&pending.original_request, merged) {
-                                            Ok(response) => {
-                                                client_write.write_all(&response).await?;
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "Failed to build merged response");
-                                                client_write.write_all(&msg.raw).await?;
-                                            }
-                                        }
-                                    } else {
-                                        // This is the first response - store it
-                                        pending.first_response = Some((Bus::Sandbox, names));
-                                    }
-                                    continue;
+                            if let Some(result) = process_merge_response(&msg, Bus::Sandbox, &mut self.pending_merges) {
+                                if let MergeResult::Complete(response) = result {
+                                    client_write.write_all(&response).await?;
                                 }
+                                continue;
                             }
 
                             // Check if this is a call to a sandbox service registered by this client
@@ -743,89 +737,11 @@ impl Session {
                                 }
                             }
 
-                            // Prepare message for client: rewrite sender header and body
-                            let mut msg_for_client = msg.clone();
-
-                            // 1. Rewrite sender header to add :s. prefix
-                            if let Err(e) = rewrite_message_header(
-                                &mut msg_for_client,
-                                RewriteDirection::ToClient,
+                            let msg_to_send = prepare_message_for_client(
+                                &msg,
                                 Bus::Sandbox,
-                            ) {
-                                tracing::warn!(error = %e, "Failed to rewrite sender header");
-                            }
-
-                            // 2. Handle body rewriting (for specific methods/signals)
-                            let msg_to_send = if msg_for_client.header.msg_type == MessageType::MethodReturn {
-                                if let Some(reply_serial) = msg_for_client.header.reply_serial {
-                                    if let Some(call_info) = self.pending_calls.get(&reply_serial) {
-                                        if call_info.bus == Bus::Sandbox {
-                                            // This is a response from sandbox bus
-                                            if let Some(ref member) = call_info.member {
-                                                if needs_response_rewrite(member) {
-                                                    match rewrite_single_name_response(&msg_for_client, Bus::Sandbox) {
-                                                        Ok(rewritten) => {
-                                                            tracing::debug!(
-                                                                member = member,
-                                                                "Rewrote sandbox response body with :s. prefix"
-                                                            );
-                                                            rewritten
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                member = member,
-                                                                error = %e,
-                                                                "Failed to rewrite sandbox response body"
-                                                            );
-                                                            msg_for_client.raw.clone()
-                                                        }
-                                                    }
-                                                } else {
-                                                    msg_for_client.raw.clone()
-                                                }
-                                            } else {
-                                                msg_for_client.raw.clone()
-                                            }
-                                        } else {
-                                            msg_for_client.raw.clone()
-                                        }
-                                    } else {
-                                        msg_for_client.raw.clone()
-                                    }
-                                } else {
-                                    msg_for_client.raw.clone()
-                                }
-                            } else if msg_for_client.header.msg_type == MessageType::Signal {
-                                // Handle signal rewriting (NameOwnerChanged)
-                                if let Some(ref member) = msg_for_client.header.member {
-                                    if signal_needs_rewrite(member) {
-                                        match rewrite_name_owner_changed(&msg_for_client, Bus::Sandbox) {
-                                            Ok(rewritten) => {
-                                                tracing::debug!(
-                                                    member = member,
-                                                    "Rewrote sandbox signal body with :s. prefix"
-                                                );
-                                                rewritten
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    member = member,
-                                                    error = %e,
-                                                    "Failed to rewrite sandbox signal body"
-                                                );
-                                                msg_for_client.raw.clone()
-                                            }
-                                        }
-                                    } else {
-                                        msg_for_client.raw.clone()
-                                    }
-                                } else {
-                                    msg_for_client.raw.clone()
-                                }
-                            } else {
-                                msg_for_client.raw.clone()
-                            };
-
+                                &self.pending_calls,
+                            );
                             log_message(&msg, "Sandbox->Client", None);
                             client_write.write_all(&msg_to_send).await?;
                         }
@@ -862,7 +778,7 @@ fn route_request(config: &Config, msg: &Message, client_exe: Option<&Path>) -> R
     // and the host bus won't accept messages from connections that haven't called Hello()
     if let Some(exe) = client_exe {
         if config.has_hostpass(exe) {
-            tracing::debug!(exe = %exe.display(), "Routing to host (hostpass)");
+            tracing::trace!(exe = %exe.display(), "Routing to host (hostpass)");
             return RouteDecision::Single(Bus::Host);
         }
     }
@@ -870,7 +786,7 @@ fn route_request(config: &Config, msg: &Message, client_exe: Option<&Path>) -> R
     // Check if destination is a fake unique name (e.g., :h.1.45)
     if let Some(ref dest) = msg.header.destination {
         if let Some(bus) = get_bus_from_fake_name(dest) {
-            tracing::debug!(dest = %dest, bus = ?bus, "Routing by fake unique name");
+            tracing::trace!(dest = %dest, bus = ?bus, "Routing by fake unique name");
             return RouteDecision::Single(bus);
         }
     }
@@ -907,7 +823,7 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
                 if let Some(ref sender) = info.sender {
                     // Check if sender is a fake unique name
                     if let Some(bus) = get_bus_from_fake_name(sender) {
-                        tracing::debug!(
+                        tracing::trace!(
                             member = member,
                             sender = %sender,
                             bus = ?bus,
@@ -919,7 +835,7 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
 
                     // Check if sender matches host_routes
                     if config.should_route_to_host(sender) {
-                        tracing::debug!(
+                        tracing::trace!(
                             member = member,
                             sender = %sender,
                             "Routing {} to host (sender in host_routes)",
@@ -934,7 +850,7 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
                     // Extract service name from interface (e.g., org.fcitx.Fcitx5.Controller1 -> org.fcitx.Fcitx5)
                     if let Some(service) = extract_service_from_interface(interface) {
                         if config.should_route_to_host(&service) {
-                            tracing::debug!(
+                            tracing::trace!(
                                 member = member,
                                 interface = %interface,
                                 service = %service,
@@ -947,7 +863,7 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
                 }
 
                 // No sender or interface to determine routing - send to both buses
-                tracing::debug!(
+                tracing::trace!(
                     member = member,
                     rule = %rule,
                     "Routing {} to both buses (no sender specified)",
@@ -964,7 +880,7 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
         "RequestName" | "ReleaseName" => {
             if let Some(name) = msg.extract_name_from_body() {
                 if config.should_route_to_host(&name) {
-                    tracing::debug!(
+                    tracing::trace!(
                         member = member,
                         name = %name,
                         "Routing {} to host (name in host_routes)",
@@ -985,7 +901,7 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
                 }
 
                 if config.should_route_to_host(&name) {
-                    tracing::debug!(
+                    tracing::trace!(
                         member = member,
                         name = %name,
                         "Routing {} to host (name in host_routes)",
@@ -1001,7 +917,7 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
         "GetConnectionCredentials" | "GetConnectionUnixUser" | "GetConnectionUnixProcessID" => {
             if let Some(name) = msg.extract_name_from_body() {
                 if let Some(bus) = get_bus_from_fake_name(&name) {
-                    tracing::debug!(
+                    tracing::trace!(
                         member = member,
                         name = %name,
                         bus = ?bus,
@@ -1017,7 +933,7 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
 
         // ListNames/ListActivatableNames: merge results from both buses
         "ListNames" | "ListActivatableNames" => {
-            tracing::debug!(member = member, "Routing {} to both buses for merge", member);
+            tracing::trace!(member = member, "Routing {} to both buses for merge", member);
             RouteDecision::Merge
         }
 

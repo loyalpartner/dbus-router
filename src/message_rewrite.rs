@@ -69,7 +69,7 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
     let fields_start = 16;
     let fields_end = fields_start + array_len;
 
-    tracing::debug!(
+    tracing::trace!(
         field_code = field_code,
         new_value = %new_value,
         array_len = array_len,

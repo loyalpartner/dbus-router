@@ -84,7 +84,7 @@ pub fn rewrite_match_rule_body(msg: &Message) -> Result<Option<Vec<u8>>> {
         if let Some((real_sender, _bus)) = from_fake_name(&sender) {
             // Rewrite the match rule with the real sender
             let new_rule = rewrite_match_rule_sender(&rule, &sender, &real_sender);
-            tracing::debug!(
+            tracing::trace!(
                 old_sender = %sender,
                 new_sender = %real_sender,
                 "Rewrote match rule sender"

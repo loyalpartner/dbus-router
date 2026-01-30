@@ -31,7 +31,7 @@ pub async fn auth_passthrough(client: &mut UnixStream, bus: &mut UnixStream) -> 
         bail!("Expected null byte, got: {}", null_byte[0]);
     }
     bus.write_all(&null_byte).await?;
-    tracing::debug!("Forwarded null byte to bus");
+    tracing::trace!("Forwarded null byte to bus");
 
     // Step 2: Forward authentication lines until BEGIN
     let mut client_buf = vec![0u8; AUTH_BUFFER_SIZE];
@@ -56,12 +56,12 @@ pub async fn auth_passthrough(client: &mut UnixStream, bus: &mut UnixStream) -> 
                     bail!("Client disconnected during auth");
                 }
 
-                tracing::debug!(line = %String::from_utf8_lossy(&line), "Client -> Bus");
+                tracing::trace!(line = %String::from_utf8_lossy(&line), "Client -> Bus");
 
                 // Track commands that expect responses
                 if is_negotiate_unix_fd(&line) {
                     pending_responses += 1;
-                    tracing::debug!(pending = pending_responses, "NEGOTIATE_UNIX_FD sent");
+                    tracing::trace!(pending = pending_responses, "NEGOTIATE_UNIX_FD sent");
                 }
 
                 bus.write_all(&line).await?;
@@ -69,7 +69,7 @@ pub async fn auth_passthrough(client: &mut UnixStream, bus: &mut UnixStream) -> 
                 // Check if this is BEGIN (end of auth phase from client side)
                 if is_begin_line(&line) {
                     begin_received = true;
-                    tracing::debug!(pending = pending_responses, "BEGIN received");
+                    tracing::trace!(pending = pending_responses, "BEGIN received");
                     // Don't return yet if we have pending responses
                 }
             }
@@ -81,12 +81,12 @@ pub async fn auth_passthrough(client: &mut UnixStream, bus: &mut UnixStream) -> 
                     bail!("Bus disconnected during auth");
                 }
 
-                tracing::debug!(line = %String::from_utf8_lossy(&line), "Bus -> Client");
+                tracing::trace!(line = %String::from_utf8_lossy(&line), "Bus -> Client");
 
                 // Track responses
                 if is_agree_unix_fd(&line) || is_error_line(&line) {
                     pending_responses = pending_responses.saturating_sub(1);
-                    tracing::debug!(pending = pending_responses, "Response received");
+                    tracing::trace!(pending = pending_responses, "Response received");
                 }
 
                 client.write_all(&line).await?;
