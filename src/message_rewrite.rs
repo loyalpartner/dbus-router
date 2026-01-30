@@ -74,11 +74,13 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
         new_value = %new_value,
         array_len = array_len,
         raw_len = raw.len(),
+        header_bytes = ?&raw[0..16.min(raw.len())],
         "rewrite_header_field called"
     );
 
     // Scan through header fields to find the target field
     let mut pos = fields_start;
+    let mut field_index = 0;
     while pos < fields_end {
         // Align to 8 bytes (struct alignment)
         let aligned_pos = (pos + 7) & !7;
@@ -102,10 +104,27 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
         pos += 1 + sig_len + 1; // length byte + signature + null terminator
 
         // Align to the variant value alignment based on type
-        let sig_byte = if sig_len == 1 { raw[pos - sig_len - 1] } else { 0 };
+        // Read the first byte of the signature (for type determination)
+        let sig_byte = if sig_len > 0 { raw[pos - sig_len - 1] } else { 0 };
+
+        tracing::trace!(
+            field_index = field_index,
+            code = code,
+            sig_len = sig_len,
+            sig_byte = sig_byte,
+            sig_char = %if sig_byte.is_ascii_graphic() { sig_byte as char } else { '?' },
+            pos = pos,
+            "Parsing header field"
+        );
+        field_index += 1;
         let value_align = match sig_byte {
-            b's' | b'o' | b'u' => 4, // strings and uint32 have 4-byte alignment
-            b'g' => 1,               // signature has 1-byte alignment
+            b's' | b'o' | b'u' | b'i' | b'b' | b'h' => 4, // strings, uint32, int32, boolean, fd: 4-byte alignment
+            b'n' | b'q' => 2,        // int16, uint16: 2-byte alignment
+            b'x' | b't' | b'd' => 8, // int64, uint64, double: 8-byte alignment
+            b'g' | b'y' => 1,        // signature, byte: 1-byte alignment
+            b'a' => 4,               // array: 4-byte alignment (for length prefix)
+            b'v' => 1,               // variant: 1-byte alignment (for signature length)
+            b'(' | b'{' => 8,        // struct, dict_entry: 8-byte alignment
             _ => 1,
         };
         pos = (pos + value_align - 1) & !(value_align - 1);
@@ -189,9 +208,7 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
             new_raw.extend_from_slice(&new_str_data);
 
             // Internal padding for struct alignment (only if there are more fields)
-            for _ in 0..new_internal_padding {
-                new_raw.push(0);
-            }
+            new_raw.extend(std::iter::repeat_n(0u8, new_internal_padding));
 
             // Rest of header fields (after the old string and its internal padding)
             if has_more_fields {
@@ -209,25 +226,111 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
         }
 
         // Skip the value based on the signature type
-        // Check signature type to determine how to skip
-        let sig_byte = if sig_len == 1 { raw[pos - sig_len - 1] } else { 0 };
+        // Read the first byte of the signature (for type determination)
+        let sig_byte = if sig_len > 0 { raw[pos - sig_len - 1] } else { 0 };
 
         match sig_byte {
-            b's' | b'o' | b'g' => {
-                // String types: 4 bytes length + string + null
+            b's' | b'o' => {
+                // String/object path: 4 bytes length + string + null
                 if pos + 4 > fields_end {
                     break;
                 }
                 let value_len = endian.read_u32(&raw[pos..]) as usize;
                 pos += 4 + value_len + 1;
             }
-            b'u' => {
-                // uint32: 4 bytes
+            b'g' => {
+                // Signature: 1 byte length + signature + null
+                if pos >= fields_end {
+                    break;
+                }
+                let value_len = raw[pos] as usize;
+                pos += 1 + value_len + 1;
+            }
+            b'u' | b'i' | b'b' | b'h' => {
+                // uint32, int32, boolean, unix fd: 4 bytes
                 pos += 4;
             }
+            b'n' | b'q' => {
+                // int16, uint16: 2 bytes
+                pos += 2;
+            }
+            b'x' | b't' | b'd' => {
+                // int64, uint64, double: 8 bytes
+                pos += 8;
+            }
+            b'y' => {
+                // byte: 1 byte
+                pos += 1;
+            }
+            b'a' => {
+                // Array: 4 bytes length + array content
+                if pos + 4 > fields_end {
+                    break;
+                }
+                let array_len = endian.read_u32(&raw[pos..]) as usize;
+                pos += 4 + array_len;
+            }
+            b'v' => {
+                // Variant: signature + value
+                // Read embedded signature length
+                if pos >= fields_end {
+                    break;
+                }
+                let vsig_len = raw[pos] as usize;
+                if pos + 1 + vsig_len + 1 > fields_end {
+                    break;
+                }
+                let vsig_byte = if vsig_len > 0 { raw[pos + 1] } else { 0 };
+                pos += 1 + vsig_len + 1; // skip signature
+                // Align and skip the variant value based on its type
+                let v_align = match vsig_byte {
+                    b's' | b'o' | b'u' | b'i' | b'b' | b'h' | b'a' => 4,
+                    b'n' | b'q' => 2,
+                    b'x' | b't' | b'd' => 8,
+                    b'(' | b'{' => 8,
+                    _ => 1,
+                };
+                pos = (pos + v_align - 1) & !(v_align - 1);
+                // Skip value (simplified: only handle basic types inside variant)
+                match vsig_byte {
+                    b's' | b'o' => {
+                        if pos + 4 > fields_end { break; }
+                        let vlen = endian.read_u32(&raw[pos..]) as usize;
+                        pos += 4 + vlen + 1;
+                    }
+                    b'g' => {
+                        if pos >= fields_end { break; }
+                        let vlen = raw[pos] as usize;
+                        pos += 1 + vlen + 1;
+                    }
+                    b'u' | b'i' | b'b' | b'h' => pos += 4,
+                    b'n' | b'q' => pos += 2,
+                    b'x' | b't' | b'd' => pos += 8,
+                    b'y' => pos += 1,
+                    _ => {
+                        // Nested complex type in variant, can't skip
+                        tracing::trace!(vsig_byte = vsig_byte, "Cannot skip nested complex type in variant");
+                        break;
+                    }
+                }
+            }
             _ => {
-                // Unknown type, can't safely skip
-                tracing::warn!(sig_byte = sig_byte, "Unknown header field type, cannot parse");
+                // Complex type (struct, dict_entry) or parsing error
+                // Dump raw bytes around position for debugging
+                let context_start = pos.saturating_sub(16);
+                let context_end = (pos + 16).min(raw.len());
+                let context_bytes: Vec<u8> = raw[context_start..context_end].to_vec();
+                tracing::warn!(
+                    field_index = field_index,
+                    field_code = code,
+                    sig_len = sig_len,
+                    sig_byte = sig_byte,
+                    sig_byte_char = %if sig_byte.is_ascii_graphic() { sig_byte as char } else { '?' },
+                    pos = pos,
+                    fields_end = fields_end,
+                    raw_context = ?context_bytes,
+                    "Unknown header field type, cannot parse"
+                );
                 break;
             }
         }
@@ -452,13 +555,8 @@ mod tests {
         // Header fields array - we'll build this manually
         // Field 7 (SENDER) with value ":1.45"
         let sender_value = b":1.45";
-        let mut fields = Vec::new();
-
-        // Align to 8 bytes (struct alignment) - we're at position 0 in fields, already aligned
-        fields.push(7); // field code for SENDER
-        fields.push(1); // signature length
-        fields.push(b's'); // signature 's' for string
-        fields.push(0); // null terminator for signature
+        // field code (7=SENDER), sig_len (1), signature ('s'), null terminator
+        let mut fields = vec![7u8, 1, b's', 0];
 
         // Align to 4 bytes for string value (we're at position 4, already aligned)
         let sender_len = sender_value.len() as u32;
@@ -520,12 +618,8 @@ mod tests {
         // Header fields array
         // Field 6 (DESTINATION) with value ":h.1.45"
         let dest_value = b":h.1.45";
-        let mut fields = Vec::new();
-
-        fields.push(6); // field code for DESTINATION
-        fields.push(1); // signature length
-        fields.push(b's'); // signature 's' for string
-        fields.push(0); // null terminator for signature
+        // field code (6=DESTINATION), sig_len (1), signature ('s'), null terminator
+        let mut fields = vec![6u8, 1, b's', 0];
 
         let dest_len = dest_value.len() as u32;
         fields.extend_from_slice(&dest_len.to_le_bytes());

@@ -79,13 +79,32 @@ fn prepare_message_for_client(
 ) -> Vec<u8> {
     let mut msg_for_client = msg.clone();
 
+    // Log message context for debugging header rewriting issues
+    tracing::trace!(
+        msg_type = ?msg.header.msg_type,
+        sender = ?msg.header.sender,
+        destination = ?msg.header.destination,
+        interface = ?msg.header.interface,
+        member = ?msg.header.member,
+        source_bus = ?source_bus,
+        "Preparing message for client"
+    );
+
     // Rewrite sender header to add bus prefix
     if let Err(e) = rewrite_message_header(
         &mut msg_for_client,
         RewriteDirection::ToClient,
         source_bus,
     ) {
-        tracing::warn!(error = %e, "Failed to rewrite sender header");
+        tracing::warn!(
+            error = %e,
+            msg_type = ?msg.header.msg_type,
+            sender = ?msg.header.sender,
+            destination = ?msg.header.destination,
+            interface = ?msg.header.interface,
+            member = ?msg.header.member,
+            "Failed to rewrite sender header"
+        );
     }
 
     // Handle body rewriting based on message type
