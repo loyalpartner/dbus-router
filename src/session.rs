@@ -2,7 +2,9 @@
 
 use crate::auth;
 use crate::config::Config;
+use crate::fake_name::get_bus_from_fake_name;
 use crate::message::{self, read_message, Message, MessageType};
+use crate::message_rewrite::parse_match_rule;
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,6 +17,51 @@ use tokio::net::UnixStream;
 pub enum Bus {
     Host,
     Sandbox,
+}
+
+/// Log a message with all relevant fields for debugging.
+fn log_message(msg: &Message, direction: &str, target: Option<Bus>) {
+    let target_str = match target {
+        Some(Bus::Host) => " -> Host",
+        Some(Bus::Sandbox) => " -> Sandbox",
+        None => "",
+    };
+
+    tracing::debug!(
+        direction = direction,
+        target = target_str,
+        msg_type = ?msg.header.msg_type,
+        serial = msg.header.serial,
+        reply_serial = ?msg.header.reply_serial,
+        sender = ?msg.header.sender,
+        destination = ?msg.header.destination,
+        interface = ?msg.header.interface,
+        member = ?msg.header.member,
+        body_len = msg.header.body_len,
+        "{}",
+        format_message_summary(msg)
+    );
+}
+
+/// Format a one-line summary of the message for logging.
+fn format_message_summary(msg: &Message) -> String {
+    let type_str = match msg.header.msg_type {
+        MessageType::MethodCall => "CALL",
+        MessageType::MethodReturn => "REPLY",
+        MessageType::Error => "ERROR",
+        MessageType::Signal => "SIGNAL",
+        MessageType::Invalid => "INVALID",
+    };
+
+    let interface = msg.header.interface.as_deref().unwrap_or("-");
+    let member = msg.header.member.as_deref().unwrap_or("-");
+    let dest = msg.header.destination.as_deref().unwrap_or("-");
+    let sender = msg.header.sender.as_deref().unwrap_or("-");
+
+    format!(
+        "{} {}.{} [{}->{}] serial={}",
+        type_str, interface, member, sender, dest, msg.header.serial
+    )
 }
 
 /// A client session with connections to both upstream buses.
@@ -271,39 +318,45 @@ impl Session {
                             if matches!(msg.header.msg_type, MessageType::MethodReturn | MessageType::Error) {
                                 if let Some(reply_serial) = msg.header.reply_serial {
                                     if let Some(Bus::Host) = self.incoming_calls.remove(&reply_serial) {
-                                        tracing::debug!(
-                                            reply_serial = reply_serial,
-                                            "Routing reply to host bus"
-                                        );
+                                        log_message(&msg, "Client->Host(reply)", Some(Bus::Host));
                                         host_write.write_all(&msg.raw).await?;
                                         continue;
                                     }
                                 }
                             }
 
-                            let target = route_request(&self.config, &msg, self.client_exe_path.as_deref());
+                            let decision = route_request(&self.config, &msg, self.client_exe_path.as_deref());
 
                             // Track RequestName calls to know which services this client exports
-                            if msg.is_request_name() && target == Bus::Host {
-                                if let Some(name) = msg.extract_name_from_body() {
-                                    tracing::info!(service = %name, "Client exporting service to host bus");
-                                    self.exported_services.insert(name);
+                            if msg.is_request_name() {
+                                if let RouteDecision::Single(Bus::Host) = decision {
+                                    if let Some(name) = msg.extract_name_from_body() {
+                                        tracing::info!(service = %name, "Client exporting service to host bus");
+                                        self.exported_services.insert(name);
+                                    }
                                 }
                             }
 
-                            self.pending_calls.insert(msg.header.serial, target);
+                            match decision {
+                                RouteDecision::Single(target) => {
+                                    self.pending_calls.insert(msg.header.serial, target);
+                                    log_message(&msg, "Client", Some(target));
 
-                            tracing::debug!(
-                                serial = msg.header.serial,
-                                destination = ?msg.header.destination,
-                                target = ?target,
-                                msg_type = ?msg.header.msg_type,
-                                "Routing message"
-                            );
+                                    match target {
+                                        Bus::Host => host_write.write_all(&msg.raw).await?,
+                                        Bus::Sandbox => sandbox_write.write_all(&msg.raw).await?,
+                                    }
+                                }
+                                RouteDecision::Both => {
+                                    // Send to both buses (e.g., AddMatch without sender)
+                                    // For replies, we'll accept from either bus
+                                    // Track as sandbox since that's the "primary" response we expect
+                                    self.pending_calls.insert(msg.header.serial, Bus::Sandbox);
+                                    log_message(&msg, "Client->Both", None);
 
-                            match target {
-                                Bus::Host => host_write.write_all(&msg.raw).await?,
-                                Bus::Sandbox => sandbox_write.write_all(&msg.raw).await?,
+                                    host_write.write_all(&msg.raw).await?;
+                                    sandbox_write.write_all(&msg.raw).await?;
+                                }
                             }
                         }
                         Ok(None) => {
@@ -325,11 +378,7 @@ impl Session {
                             if msg.header.msg_type == MessageType::MethodCall {
                                 if let Some(ref dest) = msg.header.destination {
                                     if self.exported_services.contains(dest) {
-                                        tracing::debug!(
-                                            serial = msg.header.serial,
-                                            destination = %dest,
-                                            "Routing host call to client (exported service)"
-                                        );
+                                        log_message(&msg, "Host->Client(exported)", None);
                                         self.incoming_calls.insert(msg.header.serial, Bus::Host);
                                         client_write.write_all(&msg.raw).await?;
                                         continue;
@@ -337,11 +386,7 @@ impl Session {
                                 }
                             }
 
-                            tracing::debug!(
-                                serial = msg.header.serial,
-                                reply_serial = ?msg.header.reply_serial,
-                                "Host -> Client"
-                            );
+                            log_message(&msg, "Host->Client", None);
                             client_write.write_all(&msg.raw).await?;
                         }
                         Ok(None) => {
@@ -359,11 +404,7 @@ impl Session {
                 result = read_message(&mut sandbox_read) => {
                     match result {
                         Ok(Some(msg)) => {
-                            tracing::debug!(
-                                serial = msg.header.serial,
-                                reply_serial = ?msg.header.reply_serial,
-                                "Sandbox -> Client"
-                            );
+                            log_message(&msg, "Sandbox->Client", None);
                             client_write.write_all(&msg.raw).await?;
                         }
                         Ok(None) => {
@@ -381,27 +422,198 @@ impl Session {
     }
 }
 
+/// Routing decision result
+#[derive(Debug, Clone)]
+pub enum RouteDecision {
+    /// Route to a single bus
+    Single(Bus),
+    /// Route to both buses (for AddMatch without sender)
+    Both,
+}
+
 /// Determine which bus to route a request to based on destination.
-fn route_request(config: &Config, msg: &Message, client_exe: Option<&Path>) -> Bus {
+fn route_request(config: &Config, msg: &Message, client_exe: Option<&Path>) -> RouteDecision {
     // Hostpass: route ALL messages from hostpass processes to host bus
     // This is required because D-Bus requires Hello() before any other operations,
     // and the host bus won't accept messages from connections that haven't called Hello()
     if let Some(exe) = client_exe {
         if config.has_hostpass(exe) {
             tracing::debug!(exe = %exe.display(), "Routing to host (hostpass)");
-            return Bus::Host;
+            return RouteDecision::Single(Bus::Host);
         }
+    }
+
+    // Check if destination is a fake unique name (e.g., :h.1.45)
+    if let Some(ref dest) = msg.header.destination {
+        if let Some(bus) = get_bus_from_fake_name(dest) {
+            tracing::debug!(dest = %dest, bus = ?bus, "Routing by fake unique name");
+            return RouteDecision::Single(bus);
+        }
+    }
+
+    // Special handling for org.freedesktop.DBus methods
+    if msg.header.destination.as_deref() == Some("org.freedesktop.DBus")
+        && msg.header.interface.as_deref() == Some("org.freedesktop.DBus")
+    {
+        return route_dbus_daemon_call(config, msg);
     }
 
     // Method calls and signals with a destination are routed based on config
     if let Some(ref dest) = msg.header.destination {
         if config.should_route_to_host(dest) {
-            return Bus::Host;
+            return RouteDecision::Single(Bus::Host);
         }
     }
 
     // Default: route to sandbox bus
-    Bus::Sandbox
+    RouteDecision::Single(Bus::Sandbox)
+}
+
+/// Route calls to org.freedesktop.DBus based on method and arguments
+fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
+    let member = msg.header.member.as_deref().unwrap_or("");
+
+    match member {
+        // AddMatch/RemoveMatch: route based on sender in the match rule
+        "AddMatch" | "RemoveMatch" => {
+            if let Some(rule) = msg.extract_string_from_body() {
+                let info = parse_match_rule(&rule);
+
+                // If sender is specified, route based on sender
+                if let Some(ref sender) = info.sender {
+                    // Check if sender is a fake unique name
+                    if let Some(bus) = get_bus_from_fake_name(sender) {
+                        tracing::debug!(
+                            member = member,
+                            sender = %sender,
+                            bus = ?bus,
+                            "Routing {} by fake sender name",
+                            member
+                        );
+                        return RouteDecision::Single(bus);
+                    }
+
+                    // Check if sender matches host_routes
+                    if config.should_route_to_host(sender) {
+                        tracing::debug!(
+                            member = member,
+                            sender = %sender,
+                            "Routing {} to host (sender in host_routes)",
+                            member
+                        );
+                        return RouteDecision::Single(Bus::Host);
+                    }
+                }
+
+                // If interface is specified but no sender, try to route by interface
+                if let Some(ref interface) = info.interface {
+                    // Extract service name from interface (e.g., org.fcitx.Fcitx5.Controller1 -> org.fcitx.Fcitx5)
+                    if let Some(service) = extract_service_from_interface(interface) {
+                        if config.should_route_to_host(&service) {
+                            tracing::debug!(
+                                member = member,
+                                interface = %interface,
+                                service = %service,
+                                "Routing {} to host (interface matches host_routes)",
+                                member
+                            );
+                            return RouteDecision::Single(Bus::Host);
+                        }
+                    }
+                }
+
+                // No sender or interface to determine routing - send to both buses
+                tracing::debug!(
+                    member = member,
+                    rule = %rule,
+                    "Routing {} to both buses (no sender specified)",
+                    member
+                );
+                return RouteDecision::Both;
+            }
+
+            // Can't parse rule, default to sandbox
+            RouteDecision::Single(Bus::Sandbox)
+        }
+
+        // RequestName/ReleaseName: route based on the service name being registered
+        "RequestName" | "ReleaseName" => {
+            if let Some(name) = msg.extract_name_from_body() {
+                if config.should_route_to_host(&name) {
+                    tracing::debug!(
+                        member = member,
+                        name = %name,
+                        "Routing {} to host (name in host_routes)",
+                        member
+                    );
+                    return RouteDecision::Single(Bus::Host);
+                }
+            }
+            RouteDecision::Single(Bus::Sandbox)
+        }
+
+        // GetNameOwner/NameHasOwner/StartServiceByName: route based on queried name
+        "GetNameOwner" | "NameHasOwner" | "StartServiceByName" => {
+            if let Some(name) = msg.extract_name_from_body() {
+                // Check if name is a fake unique name
+                if let Some(bus) = get_bus_from_fake_name(&name) {
+                    return RouteDecision::Single(bus);
+                }
+
+                if config.should_route_to_host(&name) {
+                    tracing::debug!(
+                        member = member,
+                        name = %name,
+                        "Routing {} to host (name in host_routes)",
+                        member
+                    );
+                    return RouteDecision::Single(Bus::Host);
+                }
+            }
+            RouteDecision::Single(Bus::Sandbox)
+        }
+
+        // GetConnectionCredentials etc: route based on unique name argument
+        "GetConnectionCredentials" | "GetConnectionUnixUser" | "GetConnectionUnixProcessID" => {
+            if let Some(name) = msg.extract_name_from_body() {
+                if let Some(bus) = get_bus_from_fake_name(&name) {
+                    tracing::debug!(
+                        member = member,
+                        name = %name,
+                        bus = ?bus,
+                        "Routing {} by fake unique name",
+                        member
+                    );
+                    return RouteDecision::Single(bus);
+                }
+            }
+            // Unknown unique name, default to sandbox
+            RouteDecision::Single(Bus::Sandbox)
+        }
+
+        // ListNames: could potentially merge results, but for now just return sandbox
+        "ListNames" | "ListActivatableNames" => {
+            // TODO: Consider merging results from both buses
+            RouteDecision::Single(Bus::Sandbox)
+        }
+
+        // Other methods: default to sandbox
+        _ => RouteDecision::Single(Bus::Sandbox),
+    }
+}
+
+/// Extract service name from an interface string.
+/// e.g., "org.fcitx.Fcitx5.Controller1" -> "org.fcitx.Fcitx5"
+fn extract_service_from_interface(interface: &str) -> Option<String> {
+    // Typically service name is the first 3 parts of the interface
+    // But this is heuristic - we try different lengths
+    let parts: Vec<&str> = interface.split('.').collect();
+    if parts.len() >= 3 {
+        // Try org.foo.Bar first (3 parts)
+        Some(parts[..3].join("."))
+    } else {
+        None
+    }
 }
 
 /// Parsed Unix socket address.

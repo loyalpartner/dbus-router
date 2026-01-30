@@ -24,10 +24,12 @@
 
 mod auth;
 mod message;
-mod session;
+mod message_rewrite;
 
 pub mod config;
+pub mod fake_name;
 pub mod router;
+pub mod session;
 
 // Re-export main types
 pub use config::{Config, RouteRule};
