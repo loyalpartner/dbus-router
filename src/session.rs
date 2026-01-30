@@ -104,7 +104,9 @@ pub struct Session {
     client_exe_path: Option<PathBuf>,
     /// Services exported by this client to the host bus
     exported_services: HashSet<String>,
-    /// Track incoming calls from host bus (serial -> source bus)
+    /// Services registered by this client on the sandbox bus
+    sandbox_services: HashSet<String>,
+    /// Track incoming calls from upstream buses (serial -> source bus)
     incoming_calls: HashMap<u32, Bus>,
     /// Pending ListNames/ListActivatableNames merges (serial -> state)
     pending_merges: HashMap<u32, PendingMerge>,
@@ -183,6 +185,7 @@ impl Session {
             pending_calls: HashMap::new(),
             client_exe_path,
             exported_services: HashSet::new(),
+            sandbox_services: HashSet::new(),
             incoming_calls: HashMap::new(),
             pending_merges: HashMap::new(),
         })
@@ -341,12 +344,30 @@ impl Session {
                 result = read_message(&mut client_read) => {
                     match result {
                         Ok(Some(msg)) => {
-                            // Check if this is a reply to an incoming host call
+                            // Check if this is a reply to an incoming call from upstream bus
                             if matches!(msg.header.msg_type, MessageType::MethodReturn | MessageType::Error) {
                                 if let Some(reply_serial) = msg.header.reply_serial {
-                                    if let Some(Bus::Host) = self.incoming_calls.remove(&reply_serial) {
-                                        log_message(&msg, "Client->Host(reply)", Some(Bus::Host));
-                                        host_write.write_all(&msg.raw).await?;
+                                    if let Some(source_bus) = self.incoming_calls.remove(&reply_serial) {
+                                        // Rewrite destination from fake name to real name
+                                        let mut msg_for_bus = msg.clone();
+                                        if let Err(e) = rewrite_message_header(
+                                            &mut msg_for_bus,
+                                            RewriteDirection::ToUpstream,
+                                            source_bus,
+                                        ) {
+                                            tracing::warn!(error = %e, "Failed to rewrite destination for reply");
+                                        }
+
+                                        match source_bus {
+                                            Bus::Host => {
+                                                log_message(&msg, "Client->Host(reply)", Some(Bus::Host));
+                                                host_write.write_all(&msg_for_bus.raw).await?;
+                                            }
+                                            Bus::Sandbox => {
+                                                log_message(&msg, "Client->Sandbox(reply)", Some(Bus::Sandbox));
+                                                sandbox_write.write_all(&msg_for_bus.raw).await?;
+                                            }
+                                        }
                                         continue;
                                     }
                                 }
@@ -356,10 +377,17 @@ impl Session {
 
                             // Track RequestName calls to know which services this client exports
                             if msg.is_request_name() {
-                                if let RouteDecision::Single(Bus::Host) = decision {
-                                    if let Some(name) = msg.extract_name_from_body() {
-                                        tracing::info!(service = %name, "Client exporting service to host bus");
-                                        self.exported_services.insert(name);
+                                if let Some(name) = msg.extract_name_from_body() {
+                                    match decision {
+                                        RouteDecision::Single(Bus::Host) => {
+                                            tracing::info!(service = %name, "Client exporting service to host bus");
+                                            self.exported_services.insert(name);
+                                        }
+                                        RouteDecision::Single(Bus::Sandbox) => {
+                                            tracing::info!(service = %name, "Client registering service on sandbox bus");
+                                            self.sandbox_services.insert(name);
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -690,6 +718,28 @@ impl Session {
                                         pending.first_response = Some((Bus::Sandbox, names));
                                     }
                                     continue;
+                                }
+                            }
+
+                            // Check if this is a call to a sandbox service registered by this client
+                            if msg.header.msg_type == MessageType::MethodCall {
+                                if let Some(ref dest) = msg.header.destination {
+                                    if self.sandbox_services.contains(dest) {
+                                        // Rewrite sender to add :s. prefix before forwarding to client
+                                        let mut msg_for_client = msg.clone();
+                                        if let Err(e) = rewrite_message_header(
+                                            &mut msg_for_client,
+                                            RewriteDirection::ToClient,
+                                            Bus::Sandbox,
+                                        ) {
+                                            tracing::warn!(error = %e, "Failed to rewrite sender header for sandbox service call");
+                                        }
+
+                                        log_message(&msg, "Sandbox->Client(service)", None);
+                                        self.incoming_calls.insert(msg.header.serial, Bus::Sandbox);
+                                        client_write.write_all(&msg_for_client.raw).await?;
+                                        continue;
+                                    }
                                 }
                             }
 

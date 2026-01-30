@@ -373,13 +373,13 @@ pub fn build_list_names_response(
         Endian::Big => to_bytes(Context::new_dbus(BE, 0), &names)?,
     };
 
-    // Build response header
-    build_method_return(original_request, &body)
+    // Build response header with signature "as" for array of strings
+    build_method_return(original_request, &body, Some("as"))
 }
 
 /// Build a MethodReturn message
-fn build_method_return(request: &Message, body: &[u8]) -> Result<Vec<u8>> {
-    use zvariant::Value;
+fn build_method_return(request: &Message, body: &[u8], signature: Option<&str>) -> Result<Vec<u8>> {
+    use zvariant::{Signature, Value};
 
     let endian = request.header.endian;
     let z_endian = match endian {
@@ -388,9 +388,14 @@ fn build_method_return(request: &Message, body: &[u8]) -> Result<Vec<u8>> {
     };
 
     // Build header fields for MethodReturn
-    let fields: Vec<(u8, Value)> = vec![
+    let mut fields: Vec<(u8, Value)> = vec![
         (5, Value::U32(request.header.serial)), // REPLY_SERIAL
     ];
+
+    // Add signature field if provided
+    if let Some(sig) = signature {
+        fields.push((8, Value::Signature(Signature::from_str_unchecked(sig)))); // SIGNATURE
+    }
 
     let ctxt = Context::new_dbus(z_endian, 12);
     let fields_encoded = to_bytes(ctxt, &fields)?;

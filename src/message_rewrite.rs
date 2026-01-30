@@ -69,6 +69,14 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
     let fields_start = 16;
     let fields_end = fields_start + array_len;
 
+    tracing::debug!(
+        field_code = field_code,
+        new_value = %new_value,
+        array_len = array_len,
+        raw_len = raw.len(),
+        "rewrite_header_field called"
+    );
+
     // Scan through header fields to find the target field
     let mut pos = fields_start;
     while pos < fields_end {
@@ -123,21 +131,43 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
             new_str_data.extend_from_slice(new_value.as_bytes());
             new_str_data.push(0); // null terminator
 
-            // Calculate size difference
-            let old_field_size = old_str_end - pos;
-            let new_field_size = new_str_data.len();
-            let size_diff = new_field_size as isize - old_field_size as isize;
+            // Calculate internal padding (alignment for next struct in array)
+            // Each header field is a struct and must start at 8-byte boundary
+            let old_internal_padding = (8 - (old_str_end % 8)) % 8;
+            let old_next_field_start = old_str_end + old_internal_padding;
+            let old_header_end = fields_end;
+
+            // Check if there are more fields after this one
+            let has_more_fields = old_next_field_start < old_header_end;
+
+            // Calculate where the new string will end in the rebuilt message
+            let new_str_end_in_new_msg = 16 + (pos - fields_start) + new_str_data.len();
+
+            // Only add internal padding if there are more fields after this one
+            let new_internal_padding = if has_more_fields {
+                (8 - (new_str_end_in_new_msg % 8)) % 8
+            } else {
+                0
+            };
+
+            // Calculate size difference including internal padding change
+            let old_field_total = if has_more_fields {
+                (old_str_end - pos) + old_internal_padding
+            } else {
+                old_str_end - pos
+            };
+            let new_field_total = new_str_data.len() + new_internal_padding;
+            let size_diff = new_field_total as isize - old_field_total as isize;
 
             // Calculate new array length
             let new_array_len = (array_len as isize + size_diff) as usize;
             let new_fields_end = fields_start + new_array_len;
 
-            // Calculate old and new padding
-            let old_header_end = fields_end;
-            let old_padding = (8 - (old_header_end % 8)) % 8;
-            let old_body_start = old_header_end + old_padding;
+            // Calculate header-to-body padding
+            let old_final_padding = (8 - (old_header_end % 8)) % 8;
+            let old_body_start = old_header_end + old_final_padding;
 
-            let new_padding = (8 - (new_fields_end % 8)) % 8;
+            let new_final_padding = (8 - (new_fields_end % 8)) % 8;
 
             // Replace the string and reconstruct the message with correct padding
             let mut new_raw = Vec::with_capacity(raw.len());
@@ -158,11 +188,18 @@ fn rewrite_header_field(raw: &mut Vec<u8>, endian: Endian, field_code: u8, new_v
             // New string data
             new_raw.extend_from_slice(&new_str_data);
 
-            // Rest of header fields (after the old string)
-            new_raw.extend_from_slice(&raw[old_str_end..old_header_end]);
+            // Internal padding for struct alignment (only if there are more fields)
+            for _ in 0..new_internal_padding {
+                new_raw.push(0);
+            }
 
-            // New padding
-            new_raw.resize(new_raw.len() + new_padding, 0);
+            // Rest of header fields (after the old string and its internal padding)
+            if has_more_fields {
+                new_raw.extend_from_slice(&raw[old_next_field_start..old_header_end]);
+            }
+
+            // Final header-to-body padding
+            new_raw.resize(new_raw.len() + new_final_padding, 0);
 
             // Body (everything after old padding)
             new_raw.extend_from_slice(&raw[old_body_start..]);
