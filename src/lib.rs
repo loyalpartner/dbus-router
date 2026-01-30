@@ -24,6 +24,7 @@
 
 mod auth;
 mod message;
+mod message_format;
 mod message_rewrite;
 
 pub mod config;

@@ -26,6 +26,7 @@ pub const METHODS_NEED_REQUEST_REWRITE: &[&str] = &[
     "GetConnectionSELinuxSecurityContext",
     "GetAdtAuditSessionData",
     "NameHasOwner",
+    "GetNameOwner",
 ];
 
 /// Methods that need result merging from both buses
@@ -57,7 +58,7 @@ pub fn signal_needs_rewrite(member: &str) -> bool {
 /// Rewrite AddMatch/RemoveMatch body to remove fake prefix from sender.
 /// Returns the rewritten message bytes if sender was rewritten, or None if no rewrite needed.
 pub fn rewrite_match_rule_body(msg: &Message) -> Result<Option<Vec<u8>>> {
-    let body_start = get_body_start(&msg.raw, msg.header.endian);
+    let body_start = msg.body_start();
 
     if body_start >= msg.raw.len() {
         return Ok(None);
@@ -94,7 +95,7 @@ pub fn rewrite_match_rule_body(msg: &Message) -> Result<Option<Vec<u8>>> {
 
 /// Rewrite a single unique name in response body (for GetNameOwner, Hello)
 pub fn rewrite_single_name_response(msg: &Message, source: Bus) -> Result<Vec<u8>> {
-    let body_start = get_body_start(&msg.raw, msg.header.endian);
+    let body_start = msg.body_start();
 
     if body_start >= msg.raw.len() {
         return Ok(msg.raw.clone());
@@ -158,7 +159,7 @@ pub fn rewrite_string_array_response(msg: &Message, source: Bus) -> Result<Vec<u
 pub fn rewrite_unique_name_request(msg: &Message) -> Result<(Vec<u8>, Bus)> {
     use crate::fake_name::from_fake_name;
 
-    let body_start = get_body_start(&msg.raw, msg.header.endian);
+    let body_start = msg.body_start();
 
     if body_start >= msg.raw.len() {
         bail!("No body in message");
@@ -223,7 +224,7 @@ pub fn merge_list_names(host_names: Vec<String>, sandbox_names: Vec<String>) -> 
 /// Rewrite NameOwnerChanged signal body
 /// Body format: (name: s, old_owner: s, new_owner: s)
 pub fn rewrite_name_owner_changed(msg: &Message, source: Bus) -> Result<Vec<u8>> {
-    let body_start = get_body_start(&msg.raw, msg.header.endian);
+    let body_start = msg.body_start();
 
     if body_start >= msg.raw.len() {
         return Ok(msg.raw.clone());
@@ -329,7 +330,7 @@ fn rebuild_message_with_body(raw: &[u8], endian: Endian, new_body: &[u8]) -> Res
 
 /// Parse a string array from message body (for ListNames response)
 pub fn parse_string_array(msg: &Message) -> Result<Vec<String>> {
-    let body_start = get_body_start(&msg.raw, msg.header.endian);
+    let body_start = msg.body_start();
 
     if body_start >= msg.raw.len() {
         return Ok(vec![]);
@@ -476,7 +477,8 @@ mod tests {
         assert!(!needs_response_rewrite("RequestName"));
 
         assert!(needs_request_rewrite("GetConnectionCredentials"));
-        assert!(!needs_request_rewrite("GetNameOwner"));
+        assert!(needs_request_rewrite("GetNameOwner"));
+        assert!(needs_request_rewrite("NameHasOwner"));
 
         assert!(needs_merge("ListNames"));
         assert!(!needs_merge("GetNameOwner"));

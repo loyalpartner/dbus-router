@@ -10,6 +10,7 @@ use crate::dbus_daemon::{
 };
 use crate::fake_name::get_bus_from_fake_name;
 use crate::message::{self, read_message, Message, MessageType};
+use crate::message_format::format_message;
 use crate::message_rewrite::{parse_match_rule, rewrite_message_header, RewriteDirection};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -46,6 +47,13 @@ fn log_message(msg: &Message, direction: &str, target: Option<Bus>) {
         body_len = msg.header.body_len,
         "{}",
         format_message_summary(msg)
+    );
+
+    // Also emit dbus-monitor style log with separate target for easy filtering
+    tracing::trace!(
+        target: "dbus_monitor",
+        "{}",
+        format_message(msg, direction, target)
     );
 }
 

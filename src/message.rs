@@ -77,6 +77,8 @@ pub struct MessageHeader {
     pub sender: Option<String>,
     pub interface: Option<String>,
     pub member: Option<String>,
+    pub path: Option<String>,
+    pub signature: Option<String>,
 }
 
 /// A complete D-Bus message (header + body as raw bytes).
@@ -95,6 +97,16 @@ impl Message {
             && self.header.member.as_deref() == Some("RequestName")
     }
 
+    /// Get the byte offset where the message body starts.
+    ///
+    /// The body starts after the header fields array, aligned to an 8-byte boundary.
+    pub fn body_start(&self) -> usize {
+        let array_len = self.header.endian.read_u32(&self.raw[FIXED_HEADER_SIZE..]) as usize;
+        let header_end = MIN_HEADER_SIZE + array_len;
+        let padding = (8 - (header_end % 8)) % 8;
+        header_end + padding
+    }
+
     /// Extract a simple string from the message body.
     /// This works for methods where the first argument is a string (AddMatch, etc.)
     pub fn extract_string_from_body(&self) -> Option<String> {
@@ -104,13 +116,7 @@ impl Message {
     /// Extract the service name from RequestName body.
     /// The body format is: STRING (name) + UINT32 (flags)
     pub fn extract_name_from_body(&self) -> Option<String> {
-        // Body starts after header (aligned to 8 bytes)
-        // Find body start position in raw message
-        let fixed_header_size = 12;
-        let array_len = self.header.endian.read_u32(&self.raw[fixed_header_size..]);
-        let header_end = 16 + array_len as usize;
-        let padding = (8 - (header_end % 8)) % 8;
-        let body_start = header_end + padding;
+        let body_start = self.body_start();
 
         if body_start + 4 > self.raw.len() {
             return None;
@@ -211,6 +217,8 @@ pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option
             sender: fields.sender,
             interface: fields.interface,
             member: fields.member,
+            path: fields.path,
+            signature: fields.signature,
         },
         raw,
     }))
@@ -224,6 +232,8 @@ struct ParsedHeaderFields {
     sender: Option<String>,
     interface: Option<String>,
     member: Option<String>,
+    path: Option<String>,
+    signature: Option<String>,
 }
 
 /// D-Bus header field as (code, value) tuple - signature a(yv)
@@ -264,12 +274,23 @@ fn parse_header_fields(buf: &[u8], endian: Endian) -> Result<ParsedHeaderFields>
     let mut result = ParsedHeaderFields::default();
     for (code, value) in fields {
         match code {
-            1 => { /* PATH - skip for now */ }
+            1 => {
+                // PATH - ObjectPath, convert to String
+                if let Value::ObjectPath(p) = &value {
+                    result.path = Some(p.to_string());
+                }
+            }
             2 => result.interface = String::try_from(&value).ok(),
             3 => result.member = String::try_from(&value).ok(),
             5 => result.reply_serial = u32::try_from(&value).ok(),
             6 => result.destination = String::try_from(&value).ok(),
             7 => result.sender = String::try_from(&value).ok(),
+            8 => {
+                // SIGNATURE
+                if let Value::Signature(s) = &value {
+                    result.signature = Some(s.to_string());
+                }
+            }
             _ => { /* skip unknown fields */ }
         }
     }
@@ -319,6 +340,8 @@ mod tests {
                 sender: None,
                 interface: Some("org.freedesktop.DBus".to_string()),
                 member: Some("RequestName".to_string()),
+                path: None,
+                signature: None,
             },
             raw: vec![],
         };
@@ -337,6 +360,8 @@ mod tests {
                 sender: None,
                 interface: Some("org.freedesktop.DBus".to_string()),
                 member: Some("Hello".to_string()),
+                path: None,
+                signature: None,
             },
             raw: vec![],
         };
@@ -355,6 +380,8 @@ mod tests {
                 sender: None,
                 interface: Some("org.freedesktop.DBus".to_string()),
                 member: Some("RequestName".to_string()),
+                path: None,
+                signature: None,
             },
             raw: vec![],
         };

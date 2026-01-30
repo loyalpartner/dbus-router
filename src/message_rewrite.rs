@@ -636,6 +636,8 @@ mod tests {
             sender: Some(":1.45".to_string()),
             interface: None,
             member: None,
+            path: None,
+            signature: None,
         };
 
         let mut msg = Message { header, raw };
@@ -698,6 +700,8 @@ mod tests {
             sender: None,
             interface: None,
             member: None,
+            path: None,
+            signature: None,
         };
 
         let mut msg = Message { header, raw };
