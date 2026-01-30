@@ -70,7 +70,7 @@ and identifies missing features that should have integration tests.
 
 | Flag | Implemented | Tested | Notes |
 |------|-------------|--------|-------|
-| NO_REPLY_EXPECTED | Unknown | No | Skip waiting for reply |
+| NO_REPLY_EXPECTED | Yes | Yes | Passthrough, message still processed |
 | NO_AUTO_START | Unknown | No | Don't activate service |
 | ALLOW_INTERACTIVE_AUTHORIZATION | Unknown | No | PolicyKit support |
 
@@ -114,19 +114,13 @@ and identifies missing features that should have integration tests.
 
 ### Remaining Tests to Implement
 
-**Priority 2: Edge Cases**
-
-1. **test_no_reply_expected.py** - Test NO_REPLY_EXPECTED flag
-   - Send method call with flag
-   - Verify no reply is sent
-
 **Priority 3: Robustness**
 
-4. **test_invalid_match_rule.py** - Invalid match rule handling
+1. **test_invalid_match_rule.py** - Invalid match rule handling
 
-5. **test_connection_timeout.py** - Connection handling edge cases
+2. **test_connection_timeout.py** - Connection handling edge cases
 
-6. **test_large_message.py** - Message size limits
+3. **test_large_message.py** - Message size limits
 
 ## Known Limitations
 

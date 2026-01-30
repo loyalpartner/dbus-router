@@ -191,54 +191,6 @@ pub fn rewrite_unique_name_request(msg: &Message) -> Result<(Vec<u8>, Bus)> {
     }
 }
 
-/// Rewrite ListNames/ListActivatableNames response - add fake prefix to all unique names
-pub fn rewrite_list_names_response(msg: &Message, source: Bus) -> Result<Vec<u8>> {
-    let body_start = get_body_start(&msg.raw, msg.header.endian);
-
-    if body_start >= msg.raw.len() {
-        return Ok(msg.raw.clone());
-    }
-
-    let z_endian = match msg.header.endian {
-        Endian::Little => ZEndian::Little,
-        Endian::Big => ZEndian::Big,
-    };
-
-    // Parse the string array from body
-    let ctxt = Context::new_dbus(z_endian, body_start);
-    let body_data = &msg.raw[body_start..];
-    let data = Data::new(body_data, ctxt);
-
-    let names: Vec<String> = match data.deserialize::<Vec<String>>() {
-        Ok((names, _)) => names,
-        Err(e) => {
-            tracing::warn!("Failed to parse ListNames response: {}", e);
-            return Ok(msg.raw.clone());
-        }
-    };
-
-    // Rewrite unique names
-    let rewritten_names: Vec<String> = names
-        .into_iter()
-        .map(|name| {
-            if is_unique_name(&name) {
-                to_fake_name(&name, source)
-            } else {
-                name
-            }
-        })
-        .collect();
-
-    // Serialize the new array
-    let new_body = match msg.header.endian {
-        Endian::Little => to_bytes(Context::new_dbus(LE, 0), &rewritten_names)?,
-        Endian::Big => to_bytes(Context::new_dbus(BE, 0), &rewritten_names)?,
-    };
-
-    // Rebuild message with new body
-    rebuild_message_with_body(&msg.raw, msg.header.endian, &new_body)
-}
-
 /// Merge ListNames results from both buses
 pub fn merge_list_names(host_names: Vec<String>, sandbox_names: Vec<String>) -> Vec<String> {
     use std::collections::HashSet;
