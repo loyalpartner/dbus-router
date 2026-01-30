@@ -355,4 +355,140 @@ mod tests {
         let sender = parse_match_rule_sender(rule);
         assert_eq!(sender, Some(":s.1.23".to_string()));
     }
+
+    #[test]
+    fn test_rewrite_header_field_sender() {
+        use crate::message::{MessageHeader, MessageType};
+
+        // Build a minimal D-Bus message with sender ":1.45"
+        // Format: fixed header (12 bytes) + array length (4 bytes) + header fields + padding + body
+        let mut raw = vec![
+            b'l',  // Little endian
+            1,     // METHOD_CALL
+            0,     // flags
+            1,     // protocol version
+            0, 0, 0, 0, // body length (0)
+            1, 0, 0, 0, // serial (1)
+        ];
+
+        // Header fields array - we'll build this manually
+        // Field 7 (SENDER) with value ":1.45"
+        let sender_value = b":1.45";
+        let mut fields = Vec::new();
+
+        // Align to 8 bytes (struct alignment) - we're at position 0 in fields, already aligned
+        fields.push(7); // field code for SENDER
+        fields.push(1); // signature length
+        fields.push(b's'); // signature 's' for string
+        fields.push(0); // null terminator for signature
+
+        // Align to 4 bytes for string value (we're at position 4, already aligned)
+        let sender_len = sender_value.len() as u32;
+        fields.extend_from_slice(&sender_len.to_le_bytes());
+        fields.extend_from_slice(sender_value);
+        fields.push(0); // null terminator
+
+        // Add array length to raw
+        let array_len = fields.len() as u32;
+        raw.extend_from_slice(&array_len.to_le_bytes());
+        raw.extend_from_slice(&fields);
+
+        // Add padding to 8-byte boundary
+        let header_end = 16 + fields.len();
+        let padding = (8 - (header_end % 8)) % 8;
+        raw.resize(raw.len() + padding, 0);
+
+        let header = MessageHeader {
+            endian: Endian::Little,
+            msg_type: MessageType::MethodCall,
+            flags: 0,
+            serial: 1,
+            body_len: 0,
+            destination: None,
+            reply_serial: None,
+            sender: Some(":1.45".to_string()),
+            interface: None,
+            member: None,
+        };
+
+        let mut msg = Message { header, raw };
+
+        // Rewrite sender to add :h. prefix
+        let result = rewrite_message_header(&mut msg, RewriteDirection::ToClient, Bus::Host);
+        assert!(result.is_ok());
+
+        // Check that the sender was updated
+        assert_eq!(msg.header.sender, Some(":h.1.45".to_string()));
+
+        // Verify the raw bytes contain the new sender
+        let raw_str = String::from_utf8_lossy(&msg.raw);
+        assert!(raw_str.contains(":h.1.45"));
+    }
+
+    #[test]
+    fn test_rewrite_header_field_destination() {
+        use crate::message::{MessageHeader, MessageType};
+
+        // Build a minimal D-Bus message with destination ":h.1.45"
+        let mut raw = vec![
+            b'l',  // Little endian
+            1,     // METHOD_CALL
+            0,     // flags
+            1,     // protocol version
+            0, 0, 0, 0, // body length (0)
+            1, 0, 0, 0, // serial (1)
+        ];
+
+        // Header fields array
+        // Field 6 (DESTINATION) with value ":h.1.45"
+        let dest_value = b":h.1.45";
+        let mut fields = Vec::new();
+
+        fields.push(6); // field code for DESTINATION
+        fields.push(1); // signature length
+        fields.push(b's'); // signature 's' for string
+        fields.push(0); // null terminator for signature
+
+        let dest_len = dest_value.len() as u32;
+        fields.extend_from_slice(&dest_len.to_le_bytes());
+        fields.extend_from_slice(dest_value);
+        fields.push(0); // null terminator
+
+        // Add array length to raw
+        let array_len = fields.len() as u32;
+        raw.extend_from_slice(&array_len.to_le_bytes());
+        raw.extend_from_slice(&fields);
+
+        // Add padding to 8-byte boundary
+        let header_end = 16 + fields.len();
+        let padding = (8 - (header_end % 8)) % 8;
+        raw.resize(raw.len() + padding, 0);
+
+        let header = MessageHeader {
+            endian: Endian::Little,
+            msg_type: MessageType::MethodCall,
+            flags: 0,
+            serial: 1,
+            body_len: 0,
+            destination: Some(":h.1.45".to_string()),
+            reply_serial: None,
+            sender: None,
+            interface: None,
+            member: None,
+        };
+
+        let mut msg = Message { header, raw };
+
+        // Rewrite destination to remove :h. prefix
+        let result = rewrite_message_header(&mut msg, RewriteDirection::ToUpstream, Bus::Host);
+        assert!(result.is_ok());
+
+        // Check that the destination was updated
+        assert_eq!(msg.header.destination, Some(":1.45".to_string()));
+
+        // Verify the raw bytes contain the new destination
+        let raw_str = String::from_utf8_lossy(&msg.raw);
+        assert!(raw_str.contains(":1.45"));
+        assert!(!raw_str.contains(":h.1.45"));
+    }
 }
