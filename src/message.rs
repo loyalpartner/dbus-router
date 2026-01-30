@@ -80,7 +80,7 @@ pub struct MessageHeader {
 }
 
 /// A complete D-Bus message (header + body as raw bytes).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Message {
     pub header: MessageHeader,
     /// Raw message bytes including header and body

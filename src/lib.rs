@@ -27,6 +27,7 @@ mod message;
 mod message_rewrite;
 
 pub mod config;
+pub mod dbus_daemon;
 pub mod fake_name;
 pub mod router;
 pub mod session;

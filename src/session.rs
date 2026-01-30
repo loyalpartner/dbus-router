@@ -2,6 +2,11 @@
 
 use crate::auth;
 use crate::config::Config;
+use crate::dbus_daemon::{
+    build_list_names_response, merge_list_names, needs_request_rewrite,
+    needs_response_rewrite, parse_string_array, rewrite_name_owner_changed,
+    rewrite_single_name_response, rewrite_unique_name_request, signal_needs_rewrite,
+};
 use crate::fake_name::get_bus_from_fake_name;
 use crate::message::{self, read_message, Message, MessageType};
 use crate::message_rewrite::parse_match_rule;
@@ -64,6 +69,24 @@ fn format_message_summary(msg: &Message) -> String {
     )
 }
 
+/// Pending merge state for ListNames/ListActivatableNames
+#[derive(Debug)]
+struct PendingMerge {
+    /// The original request message (for building response)
+    original_request: Message,
+    /// First response received (None if waiting for first)
+    first_response: Option<(Bus, Vec<String>)>,
+}
+
+/// Info about a pending call (for response rewriting)
+#[derive(Debug, Clone)]
+struct PendingCallInfo {
+    /// Which bus the call was sent to
+    bus: Bus,
+    /// The member (method name) of the call (for response rewriting)
+    member: Option<String>,
+}
+
 /// A client session with connections to both upstream buses.
 pub struct Session {
     /// Connection from sandbox app
@@ -75,13 +98,15 @@ pub struct Session {
     /// Routing configuration
     config: Arc<Config>,
     /// Track which bus each outgoing serial was sent to (for routing replies)
-    pending_calls: HashMap<u32, Bus>,
+    pending_calls: HashMap<u32, PendingCallInfo>,
     /// Client process executable path (for sandbox export permission check)
     client_exe_path: Option<PathBuf>,
     /// Services exported by this client to the host bus
     exported_services: HashSet<String>,
     /// Track incoming calls from host bus (serial -> source bus)
     incoming_calls: HashMap<u32, Bus>,
+    /// Pending ListNames/ListActivatableNames merges (serial -> state)
+    pending_merges: HashMap<u32, PendingMerge>,
 }
 
 /// Get the executable path of a peer process from a Unix socket.
@@ -158,6 +183,7 @@ impl Session {
             client_exe_path,
             exported_services: HashSet::new(),
             incoming_calls: HashMap::new(),
+            pending_merges: HashMap::new(),
         })
     }
 
@@ -339,20 +365,69 @@ impl Session {
 
                             match decision {
                                 RouteDecision::Single(target) => {
-                                    self.pending_calls.insert(msg.header.serial, target);
+                                    // Check if we need to rewrite request (remove fake prefix)
+                                    let msg_to_send = if msg.header.destination.as_deref() == Some("org.freedesktop.DBus") {
+                                        if let Some(member) = msg.header.member.as_deref() {
+                                            if needs_request_rewrite(member) {
+                                                match rewrite_unique_name_request(&msg) {
+                                                    Ok((rewritten, _bus)) => {
+                                                        tracing::debug!(
+                                                            member = member,
+                                                            "Rewrote request to remove fake prefix"
+                                                        );
+                                                        rewritten
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            member = member,
+                                                            error = %e,
+                                                            "Failed to rewrite request"
+                                                        );
+                                                        msg.raw.clone()
+                                                    }
+                                                }
+                                            } else {
+                                                msg.raw.clone()
+                                            }
+                                        } else {
+                                            msg.raw.clone()
+                                        }
+                                    } else {
+                                        msg.raw.clone()
+                                    };
+
+                                    self.pending_calls.insert(msg.header.serial, PendingCallInfo {
+                                        bus: target,
+                                        member: msg.header.member.clone(),
+                                    });
                                     log_message(&msg, "Client", Some(target));
 
                                     match target {
-                                        Bus::Host => host_write.write_all(&msg.raw).await?,
-                                        Bus::Sandbox => sandbox_write.write_all(&msg.raw).await?,
+                                        Bus::Host => host_write.write_all(&msg_to_send).await?,
+                                        Bus::Sandbox => sandbox_write.write_all(&msg_to_send).await?,
                                     }
                                 }
                                 RouteDecision::Both => {
                                     // Send to both buses (e.g., AddMatch without sender)
                                     // For replies, we'll accept from either bus
                                     // Track as sandbox since that's the "primary" response we expect
-                                    self.pending_calls.insert(msg.header.serial, Bus::Sandbox);
+                                    self.pending_calls.insert(msg.header.serial, PendingCallInfo {
+                                        bus: Bus::Sandbox,
+                                        member: msg.header.member.clone(),
+                                    });
                                     log_message(&msg, "Client->Both", None);
+
+                                    host_write.write_all(&msg.raw).await?;
+                                    sandbox_write.write_all(&msg.raw).await?;
+                                }
+                                RouteDecision::Merge => {
+                                    // ListNames/ListActivatableNames: send to both and merge results
+                                    log_message(&msg, "Client->Merge", None);
+
+                                    self.pending_merges.insert(msg.header.serial, PendingMerge {
+                                        original_request: msg.clone(),
+                                        first_response: None,
+                                    });
 
                                     host_write.write_all(&msg.raw).await?;
                                     sandbox_write.write_all(&msg.raw).await?;
@@ -386,8 +461,122 @@ impl Session {
                                 }
                             }
 
+                            // Check if this is a response to a pending merge request
+                            if let Some(reply_serial) = msg.header.reply_serial {
+                                if let Some(pending) = self.pending_merges.get_mut(&reply_serial) {
+                                    let names = parse_string_array(&msg).unwrap_or_default();
+                                    tracing::debug!(
+                                        serial = reply_serial,
+                                        count = names.len(),
+                                        "Received host ListNames response"
+                                    );
+
+                                    if let Some((first_bus, first_names)) = pending.first_response.take() {
+                                        // This is the second response - merge and send
+                                        let (host_names, sandbox_names) = if first_bus == Bus::Host {
+                                            (first_names, names)
+                                        } else {
+                                            (names, first_names)
+                                        };
+
+                                        let merged = merge_list_names(host_names, sandbox_names);
+                                        tracing::debug!(
+                                            serial = reply_serial,
+                                            count = merged.len(),
+                                            "Merged ListNames response"
+                                        );
+
+                                        let pending = self.pending_merges.remove(&reply_serial).unwrap();
+                                        match build_list_names_response(&pending.original_request, merged) {
+                                            Ok(response) => {
+                                                client_write.write_all(&response).await?;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "Failed to build merged response");
+                                                client_write.write_all(&msg.raw).await?;
+                                            }
+                                        }
+                                    } else {
+                                        // This is the first response - store it
+                                        pending.first_response = Some((Bus::Host, names));
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // Handle response rewriting (add fake prefix to unique names)
+                            let msg_to_send = if msg.header.msg_type == MessageType::MethodReturn {
+                                if let Some(reply_serial) = msg.header.reply_serial {
+                                    if let Some(call_info) = self.pending_calls.get(&reply_serial) {
+                                        if call_info.bus == Bus::Host {
+                                            // This is a response from host bus
+                                            if let Some(ref member) = call_info.member {
+                                                if needs_response_rewrite(member) {
+                                                    match rewrite_single_name_response(&msg, Bus::Host) {
+                                                        Ok(rewritten) => {
+                                                            tracing::debug!(
+                                                                member = member,
+                                                                "Rewrote host response with :h. prefix"
+                                                            );
+                                                            rewritten
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                member = member,
+                                                                error = %e,
+                                                                "Failed to rewrite host response"
+                                                            );
+                                                            msg.raw.clone()
+                                                        }
+                                                    }
+                                                } else {
+                                                    msg.raw.clone()
+                                                }
+                                            } else {
+                                                msg.raw.clone()
+                                            }
+                                        } else {
+                                            msg.raw.clone()
+                                        }
+                                    } else {
+                                        msg.raw.clone()
+                                    }
+                                } else {
+                                    msg.raw.clone()
+                                }
+                            } else if msg.header.msg_type == MessageType::Signal {
+                                // Handle signal rewriting (NameOwnerChanged)
+                                if let Some(ref member) = msg.header.member {
+                                    if signal_needs_rewrite(member) {
+                                        match rewrite_name_owner_changed(&msg, Bus::Host) {
+                                            Ok(rewritten) => {
+                                                tracing::debug!(
+                                                    member = member,
+                                                    "Rewrote host signal with :h. prefix"
+                                                );
+                                                rewritten
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    member = member,
+                                                    error = %e,
+                                                    "Failed to rewrite host signal"
+                                                );
+                                                msg.raw.clone()
+                                            }
+                                        }
+                                    } else {
+                                        msg.raw.clone()
+                                    }
+                                } else {
+                                    msg.raw.clone()
+                                }
+                            } else {
+                                msg.raw.clone()
+                            };
+
                             log_message(&msg, "Host->Client", None);
-                            client_write.write_all(&msg.raw).await?;
+                            client_write.write_all(&msg_to_send).await?;
                         }
                         Ok(None) => {
                             tracing::debug!("Host bus disconnected");
@@ -404,8 +593,122 @@ impl Session {
                 result = read_message(&mut sandbox_read) => {
                     match result {
                         Ok(Some(msg)) => {
+                            // Check if this is a response to a pending merge request
+                            if let Some(reply_serial) = msg.header.reply_serial {
+                                if let Some(pending) = self.pending_merges.get_mut(&reply_serial) {
+                                    let names = parse_string_array(&msg).unwrap_or_default();
+                                    tracing::debug!(
+                                        serial = reply_serial,
+                                        count = names.len(),
+                                        "Received sandbox ListNames response"
+                                    );
+
+                                    if let Some((first_bus, first_names)) = pending.first_response.take() {
+                                        // This is the second response - merge and send
+                                        let (host_names, sandbox_names) = if first_bus == Bus::Host {
+                                            (first_names, names)
+                                        } else {
+                                            (names, first_names)
+                                        };
+
+                                        let merged = merge_list_names(host_names, sandbox_names);
+                                        tracing::debug!(
+                                            serial = reply_serial,
+                                            count = merged.len(),
+                                            "Merged ListNames response"
+                                        );
+
+                                        let pending = self.pending_merges.remove(&reply_serial).unwrap();
+                                        match build_list_names_response(&pending.original_request, merged) {
+                                            Ok(response) => {
+                                                client_write.write_all(&response).await?;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "Failed to build merged response");
+                                                client_write.write_all(&msg.raw).await?;
+                                            }
+                                        }
+                                    } else {
+                                        // This is the first response - store it
+                                        pending.first_response = Some((Bus::Sandbox, names));
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // Handle response rewriting (add fake prefix to unique names)
+                            let msg_to_send = if msg.header.msg_type == MessageType::MethodReturn {
+                                if let Some(reply_serial) = msg.header.reply_serial {
+                                    if let Some(call_info) = self.pending_calls.get(&reply_serial) {
+                                        if call_info.bus == Bus::Sandbox {
+                                            // This is a response from sandbox bus
+                                            if let Some(ref member) = call_info.member {
+                                                if needs_response_rewrite(member) {
+                                                    match rewrite_single_name_response(&msg, Bus::Sandbox) {
+                                                        Ok(rewritten) => {
+                                                            tracing::debug!(
+                                                                member = member,
+                                                                "Rewrote sandbox response with :s. prefix"
+                                                            );
+                                                            rewritten
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                member = member,
+                                                                error = %e,
+                                                                "Failed to rewrite sandbox response"
+                                                            );
+                                                            msg.raw.clone()
+                                                        }
+                                                    }
+                                                } else {
+                                                    msg.raw.clone()
+                                                }
+                                            } else {
+                                                msg.raw.clone()
+                                            }
+                                        } else {
+                                            msg.raw.clone()
+                                        }
+                                    } else {
+                                        msg.raw.clone()
+                                    }
+                                } else {
+                                    msg.raw.clone()
+                                }
+                            } else if msg.header.msg_type == MessageType::Signal {
+                                // Handle signal rewriting (NameOwnerChanged)
+                                if let Some(ref member) = msg.header.member {
+                                    if signal_needs_rewrite(member) {
+                                        match rewrite_name_owner_changed(&msg, Bus::Sandbox) {
+                                            Ok(rewritten) => {
+                                                tracing::debug!(
+                                                    member = member,
+                                                    "Rewrote sandbox signal with :s. prefix"
+                                                );
+                                                rewritten
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    member = member,
+                                                    error = %e,
+                                                    "Failed to rewrite sandbox signal"
+                                                );
+                                                msg.raw.clone()
+                                            }
+                                        }
+                                    } else {
+                                        msg.raw.clone()
+                                    }
+                                } else {
+                                    msg.raw.clone()
+                                }
+                            } else {
+                                msg.raw.clone()
+                            };
+
                             log_message(&msg, "Sandbox->Client", None);
-                            client_write.write_all(&msg.raw).await?;
+                            client_write.write_all(&msg_to_send).await?;
                         }
                         Ok(None) => {
                             tracing::debug!("Sandbox bus disconnected");
@@ -429,6 +732,8 @@ pub enum RouteDecision {
     Single(Bus),
     /// Route to both buses (for AddMatch without sender)
     Both,
+    /// Route to both buses and merge results (for ListNames)
+    Merge,
 }
 
 /// Determine which bus to route a request to based on destination.
@@ -591,10 +896,10 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
             RouteDecision::Single(Bus::Sandbox)
         }
 
-        // ListNames: could potentially merge results, but for now just return sandbox
+        // ListNames/ListActivatableNames: merge results from both buses
         "ListNames" | "ListActivatableNames" => {
-            // TODO: Consider merging results from both buses
-            RouteDecision::Single(Bus::Sandbox)
+            tracing::debug!(member = member, "Routing {} to both buses for merge", member);
+            RouteDecision::Merge
         }
 
         // Other methods: default to sandbox

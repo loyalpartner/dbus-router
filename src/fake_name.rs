@@ -63,15 +63,12 @@ pub fn to_fake_name(real: &str, source: Bus) -> String {
 /// assert_eq!(from_fake_name(":1.45"), None); // No prefix
 /// ```
 pub fn from_fake_name(fake: &str) -> Option<(String, Bus)> {
-    if fake.starts_with(HOST_PREFIX) {
-        let suffix = &fake[HOST_PREFIX.len()..];
-        Some((format!(":{}", suffix), Bus::Host))
-    } else if fake.starts_with(SANDBOX_PREFIX) {
-        let suffix = &fake[SANDBOX_PREFIX.len()..];
-        Some((format!(":{}", suffix), Bus::Sandbox))
-    } else {
-        None
-    }
+    fake.strip_prefix(HOST_PREFIX)
+        .map(|suffix| (format!(":{}", suffix), Bus::Host))
+        .or_else(|| {
+            fake.strip_prefix(SANDBOX_PREFIX)
+                .map(|suffix| (format!(":{}", suffix), Bus::Sandbox))
+        })
 }
 
 /// Check if a name is a unique name (starts with ':').
