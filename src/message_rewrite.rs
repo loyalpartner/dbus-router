@@ -331,4 +331,28 @@ mod tests {
         assert!(get_dbus_method_rewrite_info("ListNames").is_some());
         assert!(get_dbus_method_rewrite_info("SomeOtherMethod").is_none());
     }
+
+    #[test]
+    fn test_rewrite_match_rule_with_fake_sender() {
+        // Test rewriting match rule with fake unique name
+        let rule = "type='signal',sender=':h.1.45',interface='org.test'";
+        let rewritten = rewrite_match_rule_sender(rule, ":h.1.45", ":1.45");
+        assert_eq!(rewritten, "type='signal',sender=':1.45',interface='org.test'");
+
+        // Test with sandbox prefix
+        let rule = "type='signal',sender=':s.1.23',member='Test'";
+        let rewritten = rewrite_match_rule_sender(rule, ":s.1.23", ":1.23");
+        assert_eq!(rewritten, "type='signal',sender=':1.23',member='Test'");
+    }
+
+    #[test]
+    fn test_parse_match_rule_with_fake_sender() {
+        let rule = "type='signal',sender=':h.1.45',interface='org.test'";
+        let sender = parse_match_rule_sender(rule);
+        assert_eq!(sender, Some(":h.1.45".to_string()));
+
+        let rule = "type='signal',sender=':s.1.23'";
+        let sender = parse_match_rule_sender(rule);
+        assert_eq!(sender, Some(":s.1.23".to_string()));
+    }
 }

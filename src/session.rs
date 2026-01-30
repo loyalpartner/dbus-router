@@ -4,12 +4,13 @@ use crate::auth;
 use crate::config::Config;
 use crate::dbus_daemon::{
     build_list_names_response, merge_list_names, needs_request_rewrite,
-    needs_response_rewrite, parse_string_array, rewrite_name_owner_changed,
-    rewrite_single_name_response, rewrite_unique_name_request, signal_needs_rewrite,
+    needs_response_rewrite, parse_string_array, rewrite_match_rule_body,
+    rewrite_name_owner_changed, rewrite_single_name_response, rewrite_unique_name_request,
+    signal_needs_rewrite,
 };
 use crate::fake_name::get_bus_from_fake_name;
 use crate::message::{self, read_message, Message, MessageType};
-use crate::message_rewrite::parse_match_rule;
+use crate::message_rewrite::{parse_match_rule, rewrite_message_header, RewriteDirection};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -365,15 +366,28 @@ impl Session {
 
                             match decision {
                                 RouteDecision::Single(target) => {
-                                    // Check if we need to rewrite request (remove fake prefix)
-                                    let msg_to_send = if msg.header.destination.as_deref() == Some("org.freedesktop.DBus") {
-                                        if let Some(member) = msg.header.member.as_deref() {
+                                    // Prepare message for sending to upstream
+                                    let mut msg_for_upstream = msg.clone();
+
+                                    // 1. Rewrite destination header if it's a fake unique name
+                                    if let Err(e) = rewrite_message_header(
+                                        &mut msg_for_upstream,
+                                        RewriteDirection::ToUpstream,
+                                        target, // source_bus not used for ToUpstream
+                                    ) {
+                                        tracing::warn!(error = %e, "Failed to rewrite destination header");
+                                    }
+
+                                    // 2. Rewrite body for org.freedesktop.DBus methods
+                                    let msg_to_send = if msg_for_upstream.header.destination.as_deref() == Some("org.freedesktop.DBus") {
+                                        if let Some(member) = msg_for_upstream.header.member.as_deref() {
                                             if needs_request_rewrite(member) {
-                                                match rewrite_unique_name_request(&msg) {
+                                                // Rewrite unique name in body (GetConnectionCredentials etc.)
+                                                match rewrite_unique_name_request(&msg_for_upstream) {
                                                     Ok((rewritten, _bus)) => {
                                                         tracing::debug!(
                                                             member = member,
-                                                            "Rewrote request to remove fake prefix"
+                                                            "Rewrote request body to remove fake prefix"
                                                         );
                                                         rewritten
                                                     }
@@ -381,19 +395,39 @@ impl Session {
                                                         tracing::warn!(
                                                             member = member,
                                                             error = %e,
-                                                            "Failed to rewrite request"
+                                                            "Failed to rewrite request body"
                                                         );
-                                                        msg.raw.clone()
+                                                        msg_for_upstream.raw.clone()
+                                                    }
+                                                }
+                                            } else if member == "AddMatch" || member == "RemoveMatch" {
+                                                // Rewrite sender in match rule
+                                                match rewrite_match_rule_body(&msg_for_upstream) {
+                                                    Ok(Some(rewritten)) => {
+                                                        tracing::debug!(
+                                                            member = member,
+                                                            "Rewrote match rule sender"
+                                                        );
+                                                        rewritten
+                                                    }
+                                                    Ok(None) => msg_for_upstream.raw.clone(),
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            member = member,
+                                                            error = %e,
+                                                            "Failed to rewrite match rule"
+                                                        );
+                                                        msg_for_upstream.raw.clone()
                                                     }
                                                 }
                                             } else {
-                                                msg.raw.clone()
+                                                msg_for_upstream.raw.clone()
                                             }
                                         } else {
-                                            msg.raw.clone()
+                                            msg_for_upstream.raw.clone()
                                         }
                                     } else {
-                                        msg.raw.clone()
+                                        msg_for_upstream.raw.clone()
                                     };
 
                                     self.pending_calls.insert(msg.header.serial, PendingCallInfo {
@@ -409,16 +443,27 @@ impl Session {
                                 }
                                 RouteDecision::Both => {
                                     // Send to both buses (e.g., AddMatch without sender)
-                                    // For replies, we'll accept from either bus
-                                    // Track as sandbox since that's the "primary" response we expect
+                                    // Rewrite match rule body if needed
+                                    let msg_to_send = if msg.header.member.as_deref() == Some("AddMatch")
+                                        || msg.header.member.as_deref() == Some("RemoveMatch")
+                                    {
+                                        match rewrite_match_rule_body(&msg) {
+                                            Ok(Some(rewritten)) => rewritten,
+                                            Ok(None) => msg.raw.clone(),
+                                            Err(_) => msg.raw.clone(),
+                                        }
+                                    } else {
+                                        msg.raw.clone()
+                                    };
+
                                     self.pending_calls.insert(msg.header.serial, PendingCallInfo {
                                         bus: Bus::Sandbox,
                                         member: msg.header.member.clone(),
                                     });
                                     log_message(&msg, "Client->Both", None);
 
-                                    host_write.write_all(&msg.raw).await?;
-                                    sandbox_write.write_all(&msg.raw).await?;
+                                    host_write.write_all(&msg_to_send).await?;
+                                    sandbox_write.write_all(&msg_to_send).await?;
                                 }
                                 RouteDecision::Merge => {
                                     // ListNames/ListActivatableNames: send to both and merge results
@@ -504,19 +549,31 @@ impl Session {
                                 }
                             }
 
-                            // Handle response rewriting (add fake prefix to unique names)
-                            let msg_to_send = if msg.header.msg_type == MessageType::MethodReturn {
-                                if let Some(reply_serial) = msg.header.reply_serial {
+                            // Prepare message for client: rewrite sender header and body
+                            let mut msg_for_client = msg.clone();
+
+                            // 1. Rewrite sender header to add :h. prefix
+                            if let Err(e) = rewrite_message_header(
+                                &mut msg_for_client,
+                                RewriteDirection::ToClient,
+                                Bus::Host,
+                            ) {
+                                tracing::warn!(error = %e, "Failed to rewrite sender header");
+                            }
+
+                            // 2. Handle body rewriting (for specific methods/signals)
+                            let msg_to_send = if msg_for_client.header.msg_type == MessageType::MethodReturn {
+                                if let Some(reply_serial) = msg_for_client.header.reply_serial {
                                     if let Some(call_info) = self.pending_calls.get(&reply_serial) {
                                         if call_info.bus == Bus::Host {
                                             // This is a response from host bus
                                             if let Some(ref member) = call_info.member {
                                                 if needs_response_rewrite(member) {
-                                                    match rewrite_single_name_response(&msg, Bus::Host) {
+                                                    match rewrite_single_name_response(&msg_for_client, Bus::Host) {
                                                         Ok(rewritten) => {
                                                             tracing::debug!(
                                                                 member = member,
-                                                                "Rewrote host response with :h. prefix"
+                                                                "Rewrote host response body with :h. prefix"
                                                             );
                                                             rewritten
                                                         }
@@ -524,35 +581,35 @@ impl Session {
                                                             tracing::warn!(
                                                                 member = member,
                                                                 error = %e,
-                                                                "Failed to rewrite host response"
+                                                                "Failed to rewrite host response body"
                                                             );
-                                                            msg.raw.clone()
+                                                            msg_for_client.raw.clone()
                                                         }
                                                     }
                                                 } else {
-                                                    msg.raw.clone()
+                                                    msg_for_client.raw.clone()
                                                 }
                                             } else {
-                                                msg.raw.clone()
+                                                msg_for_client.raw.clone()
                                             }
                                         } else {
-                                            msg.raw.clone()
+                                            msg_for_client.raw.clone()
                                         }
                                     } else {
-                                        msg.raw.clone()
+                                        msg_for_client.raw.clone()
                                     }
                                 } else {
-                                    msg.raw.clone()
+                                    msg_for_client.raw.clone()
                                 }
-                            } else if msg.header.msg_type == MessageType::Signal {
+                            } else if msg_for_client.header.msg_type == MessageType::Signal {
                                 // Handle signal rewriting (NameOwnerChanged)
-                                if let Some(ref member) = msg.header.member {
+                                if let Some(ref member) = msg_for_client.header.member {
                                     if signal_needs_rewrite(member) {
-                                        match rewrite_name_owner_changed(&msg, Bus::Host) {
+                                        match rewrite_name_owner_changed(&msg_for_client, Bus::Host) {
                                             Ok(rewritten) => {
                                                 tracing::debug!(
                                                     member = member,
-                                                    "Rewrote host signal with :h. prefix"
+                                                    "Rewrote host signal body with :h. prefix"
                                                 );
                                                 rewritten
                                             }
@@ -560,19 +617,19 @@ impl Session {
                                                 tracing::warn!(
                                                     member = member,
                                                     error = %e,
-                                                    "Failed to rewrite host signal"
+                                                    "Failed to rewrite host signal body"
                                                 );
-                                                msg.raw.clone()
+                                                msg_for_client.raw.clone()
                                             }
                                         }
                                     } else {
-                                        msg.raw.clone()
+                                        msg_for_client.raw.clone()
                                     }
                                 } else {
-                                    msg.raw.clone()
+                                    msg_for_client.raw.clone()
                                 }
                             } else {
-                                msg.raw.clone()
+                                msg_for_client.raw.clone()
                             };
 
                             log_message(&msg, "Host->Client", None);
@@ -636,19 +693,31 @@ impl Session {
                                 }
                             }
 
-                            // Handle response rewriting (add fake prefix to unique names)
-                            let msg_to_send = if msg.header.msg_type == MessageType::MethodReturn {
-                                if let Some(reply_serial) = msg.header.reply_serial {
+                            // Prepare message for client: rewrite sender header and body
+                            let mut msg_for_client = msg.clone();
+
+                            // 1. Rewrite sender header to add :s. prefix
+                            if let Err(e) = rewrite_message_header(
+                                &mut msg_for_client,
+                                RewriteDirection::ToClient,
+                                Bus::Sandbox,
+                            ) {
+                                tracing::warn!(error = %e, "Failed to rewrite sender header");
+                            }
+
+                            // 2. Handle body rewriting (for specific methods/signals)
+                            let msg_to_send = if msg_for_client.header.msg_type == MessageType::MethodReturn {
+                                if let Some(reply_serial) = msg_for_client.header.reply_serial {
                                     if let Some(call_info) = self.pending_calls.get(&reply_serial) {
                                         if call_info.bus == Bus::Sandbox {
                                             // This is a response from sandbox bus
                                             if let Some(ref member) = call_info.member {
                                                 if needs_response_rewrite(member) {
-                                                    match rewrite_single_name_response(&msg, Bus::Sandbox) {
+                                                    match rewrite_single_name_response(&msg_for_client, Bus::Sandbox) {
                                                         Ok(rewritten) => {
                                                             tracing::debug!(
                                                                 member = member,
-                                                                "Rewrote sandbox response with :s. prefix"
+                                                                "Rewrote sandbox response body with :s. prefix"
                                                             );
                                                             rewritten
                                                         }
@@ -656,35 +725,35 @@ impl Session {
                                                             tracing::warn!(
                                                                 member = member,
                                                                 error = %e,
-                                                                "Failed to rewrite sandbox response"
+                                                                "Failed to rewrite sandbox response body"
                                                             );
-                                                            msg.raw.clone()
+                                                            msg_for_client.raw.clone()
                                                         }
                                                     }
                                                 } else {
-                                                    msg.raw.clone()
+                                                    msg_for_client.raw.clone()
                                                 }
                                             } else {
-                                                msg.raw.clone()
+                                                msg_for_client.raw.clone()
                                             }
                                         } else {
-                                            msg.raw.clone()
+                                            msg_for_client.raw.clone()
                                         }
                                     } else {
-                                        msg.raw.clone()
+                                        msg_for_client.raw.clone()
                                     }
                                 } else {
-                                    msg.raw.clone()
+                                    msg_for_client.raw.clone()
                                 }
-                            } else if msg.header.msg_type == MessageType::Signal {
+                            } else if msg_for_client.header.msg_type == MessageType::Signal {
                                 // Handle signal rewriting (NameOwnerChanged)
-                                if let Some(ref member) = msg.header.member {
+                                if let Some(ref member) = msg_for_client.header.member {
                                     if signal_needs_rewrite(member) {
-                                        match rewrite_name_owner_changed(&msg, Bus::Sandbox) {
+                                        match rewrite_name_owner_changed(&msg_for_client, Bus::Sandbox) {
                                             Ok(rewritten) => {
                                                 tracing::debug!(
                                                     member = member,
-                                                    "Rewrote sandbox signal with :s. prefix"
+                                                    "Rewrote sandbox signal body with :s. prefix"
                                                 );
                                                 rewritten
                                             }
@@ -692,19 +761,19 @@ impl Session {
                                                 tracing::warn!(
                                                     member = member,
                                                     error = %e,
-                                                    "Failed to rewrite sandbox signal"
+                                                    "Failed to rewrite sandbox signal body"
                                                 );
-                                                msg.raw.clone()
+                                                msg_for_client.raw.clone()
                                             }
                                         }
                                     } else {
-                                        msg.raw.clone()
+                                        msg_for_client.raw.clone()
                                     }
                                 } else {
-                                    msg.raw.clone()
+                                    msg_for_client.raw.clone()
                                 }
                             } else {
-                                msg.raw.clone()
+                                msg_for_client.raw.clone()
                             };
 
                             log_message(&msg, "Sandbox->Client", None);

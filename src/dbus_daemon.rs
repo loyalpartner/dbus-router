@@ -5,8 +5,9 @@
 //! - GetNameOwner: rewrite unique name in response
 //! - NameOwnerChanged: rewrite unique names in signal body
 
-use crate::fake_name::{is_unique_name, to_fake_name};
+use crate::fake_name::{from_fake_name, is_unique_name, to_fake_name};
 use crate::message::{Endian, Message};
+use crate::message_rewrite::{parse_match_rule_sender, rewrite_match_rule_sender};
 use crate::session::Bus;
 use anyhow::{bail, Result};
 use zvariant::{serialized::{Context, Data}, to_bytes, Endian as ZEndian, LE, BE};
@@ -56,6 +57,44 @@ pub fn needs_merge(member: &str) -> bool {
 /// Check if a signal needs body rewriting
 pub fn signal_needs_rewrite(member: &str) -> bool {
     SIGNALS_NEED_REWRITE.contains(&member)
+}
+
+/// Rewrite AddMatch/RemoveMatch body to remove fake prefix from sender.
+/// Returns the rewritten message bytes if sender was rewritten, or None if no rewrite needed.
+pub fn rewrite_match_rule_body(msg: &Message) -> Result<Option<Vec<u8>>> {
+    let body_start = get_body_start(&msg.raw, msg.header.endian);
+
+    if body_start >= msg.raw.len() {
+        return Ok(None);
+    }
+
+    // Parse the string from body
+    let str_len = msg.header.endian.read_u32(&msg.raw[body_start..]) as usize;
+    let str_start = body_start + 4;
+    let str_end = str_start + str_len;
+
+    if str_end > msg.raw.len() {
+        return Ok(None);
+    }
+
+    let rule = String::from_utf8_lossy(&msg.raw[str_start..str_end]).to_string();
+
+    // Check if sender in match rule is a fake unique name
+    if let Some(sender) = parse_match_rule_sender(&rule) {
+        if let Some((real_sender, _bus)) = from_fake_name(&sender) {
+            // Rewrite the match rule with the real sender
+            let new_rule = rewrite_match_rule_sender(&rule, &sender, &real_sender);
+            tracing::debug!(
+                old_sender = %sender,
+                new_sender = %real_sender,
+                "Rewrote match rule sender"
+            );
+            return rebuild_message_with_string(&msg.raw, msg.header.endian, body_start, &new_rule)
+                .map(Some);
+        }
+    }
+
+    Ok(None)
 }
 
 /// Rewrite a single unique name in response body (for GetNameOwner, Hello)
