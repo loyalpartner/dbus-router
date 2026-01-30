@@ -128,6 +128,37 @@ pub fn rewrite_single_name_response(msg: &Message, source: Bus) -> Result<Vec<u8
     rebuild_message_with_string(&msg.raw, msg.header.endian, body_start, &fake_name)
 }
 
+/// Rewrite unique names in string array response (for ListQueuedOwners)
+pub fn rewrite_string_array_response(msg: &Message, source: Bus) -> Result<Vec<u8>> {
+    let names = parse_string_array(msg)?;
+
+    if names.is_empty() {
+        return Ok(msg.raw.clone());
+    }
+
+    // Rewrite each unique name to add prefix
+    let rewritten: Vec<String> = names
+        .into_iter()
+        .map(|name| {
+            if is_unique_name(&name) {
+                to_fake_name(&name, source)
+            } else {
+                name
+            }
+        })
+        .collect();
+
+    // Serialize the new array body
+    let z_endian = match msg.header.endian {
+        Endian::Little => LE,
+        Endian::Big => BE,
+    };
+    let new_body = to_bytes(Context::new_dbus(z_endian, 0), &rewritten)?;
+
+    // Rebuild message with new body, preserving header
+    rebuild_message_with_body(&msg.raw, msg.header.endian, &new_body)
+}
+
 /// Rewrite unique name in request body (for GetConnectionCredentials etc.)
 /// Removes the fake prefix before sending to upstream
 pub fn rewrite_unique_name_request(msg: &Message) -> Result<(Vec<u8>, Bus)> {

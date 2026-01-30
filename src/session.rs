@@ -5,8 +5,8 @@ use crate::config::Config;
 use crate::dbus_daemon::{
     build_list_names_response, merge_list_names, needs_request_rewrite,
     needs_response_rewrite, parse_string_array, rewrite_match_rule_body,
-    rewrite_name_owner_changed, rewrite_single_name_response, rewrite_unique_name_request,
-    signal_needs_rewrite,
+    rewrite_name_owner_changed, rewrite_single_name_response, rewrite_string_array_response,
+    rewrite_unique_name_request, signal_needs_rewrite,
 };
 use crate::fake_name::get_bus_from_fake_name;
 use crate::message::{self, read_message, Message, MessageType};
@@ -124,7 +124,14 @@ fn rewrite_method_return_body(
         return msg.raw.clone();
     }
 
-    match rewrite_single_name_response(msg, source_bus) {
+    // ListQueuedOwners returns an array of unique names
+    let result = if member == "ListQueuedOwners" {
+        rewrite_string_array_response(msg, source_bus)
+    } else {
+        rewrite_single_name_response(msg, source_bus)
+    };
+
+    match result {
         Ok(rewritten) => {
             tracing::trace!(member = member, bus = ?source_bus, "Rewrote response body");
             rewritten

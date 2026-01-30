@@ -19,7 +19,7 @@ and identifies missing features that should have integration tests.
 | NameHasOwner | Yes | Yes | Rewrites unique name in request body |
 | GetNameOwner | Yes | Yes | Rewrites unique name in response |
 | StartServiceByName | Yes | Yes | Routes based on service name |
-| ListQueuedOwners | Routing only | No | Returns unique names - need rewrite |
+| ListQueuedOwners | Yes | Yes | Rewrites unique names in response |
 | AddMatch | Yes | Yes | Rewrites sender in match rule |
 | RemoveMatch | Yes | Yes | Same as AddMatch |
 | GetConnectionUnixUser | Yes | Yes | Rewrites unique name in request |
@@ -116,11 +116,7 @@ and identifies missing features that should have integration tests.
 
 **Priority 2: Edge Cases**
 
-1. **test_list_queued_owners.py** - ListQueuedOwners
-   - Multiple clients request same name
-   - Verify queued owners have correct prefix
-
-2. **test_match_rule_path.py** - Test path matching
+1. **test_match_rule_path.py** - Test path matching
    - Add match with specific path
    - Verify signal filtering
 
@@ -153,12 +149,6 @@ Currently tracks `sandbox_services` on RequestName. Need to:
 1. Parse ReleaseName to get service name
 2. Remove from sandbox_services on success
 3. Handle case where service was on host bus
-
-### ListQueuedOwners Response Rewriting
-Response is `ARRAY STRING` of unique names. Need to:
-1. Parse response body
-2. Add appropriate prefix (:h. or :s.) based on bus
-3. Rebuild message with rewritten body
 
 ### GetConnectionCredentials Routing
 Currently routes based on fake name prefix. Need to verify:
