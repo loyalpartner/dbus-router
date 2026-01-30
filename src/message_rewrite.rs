@@ -32,6 +32,16 @@ pub fn rewrite_message_header(msg: &mut Message, direction: RewriteDirection, so
             if let Some(ref sender) = msg.header.sender {
                 let fake_sender = to_fake_name(sender, source_bus);
                 if fake_sender != *sender {
+                    // Log message context for debugging header parsing issues
+                    tracing::debug!(
+                        msg_type = ?msg.header.msg_type,
+                        interface = ?msg.header.interface,
+                        member = ?msg.header.member,
+                        destination = ?msg.header.destination,
+                        sender = %sender,
+                        new_sender = %fake_sender,
+                        "Rewriting SENDER header field"
+                    );
                     rewrite_header_field(&mut msg.raw, msg.header.endian, 7, &fake_sender)?;
                     msg.header.sender = Some(fake_sender);
                 }
@@ -41,6 +51,14 @@ pub fn rewrite_message_header(msg: &mut Message, direction: RewriteDirection, so
             // Remove prefix from destination
             if let Some(ref dest) = msg.header.destination {
                 if let Some((real_dest, _bus)) = from_fake_name(dest) {
+                    tracing::debug!(
+                        msg_type = ?msg.header.msg_type,
+                        interface = ?msg.header.interface,
+                        member = ?msg.header.member,
+                        destination = %dest,
+                        new_destination = %real_dest,
+                        "Rewriting DESTINATION header field"
+                    );
                     rewrite_header_field(&mut msg.raw, msg.header.endian, 6, &real_dest)?;
                     msg.header.destination = Some(real_dest);
                 }
