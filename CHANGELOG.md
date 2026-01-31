@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/loyalpartner/dbus-router/compare/v0.9.0...v0.10.0) (2026-01-31)
+
+
+### Features
+
+* dbus modules and routing ([6598b74](https://github.com/loyalpartner/dbus-router/commit/6598b747d473630993eb00a1ca6ca23b0c99b306))
+
 ## [0.9.0](https://github.com/loyalpartner/dbus-router/compare/v0.8.0...v0.9.0) (2026-01-31)
 
 
