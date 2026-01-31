@@ -167,6 +167,22 @@ dbus-router \
 | ERROR          | ✅              | ✅           | ✅       |
 | SIGNAL         | ✅              | ✅           | ✅       |
 
+## Testing
+
+```bash
+# install python test deps
+cd tests && uv sync
+
+# run rust unit + python integration tests (xdist parallel by default)
+make test
+
+# customize xdist settings
+make test PYTEST_XDIST="-n 8 --dist=loadscope"
+
+# run integration tests only (serial)
+make test-integration PYTEST_XDIST=""
+```
+
 ## License
 
 MIT
