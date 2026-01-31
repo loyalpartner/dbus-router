@@ -6,36 +6,28 @@ Tests for StartServiceByName method which should:
 3. Return error for non-activatable services
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType
 
-from utils.dbus_env import dbus_session, dbus_router_session
+EMPTY_CONFIG = ""
+
+HOST_ROUTE_CONFIG = '''
+[[host_routes]]
+destination = "org.test.HostService"
+'''
 
 
-def test_start_service_not_activatable(test_log_dir: Path, build_project):
+def test_start_service_not_activatable(test_log_dir: Path, router_env):
     """StartServiceByName for non-activatable service should return error."""
-    with tempfile.TemporaryDirectory(prefix="ssn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_start_not_activatable(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="ssn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_start_not_activatable(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_start_not_activatable(router_addr: str, test_log_dir: Path) -> dict:
@@ -78,26 +70,14 @@ async def _test_start_not_activatable(router_addr: str, test_log_dir: Path) -> d
         return {"status": "exception", "error": err_str}
 
 
-def test_start_service_dbus_daemon(test_log_dir: Path, build_project):
+def test_start_service_dbus_daemon(test_log_dir: Path, router_env):
     """StartServiceByName for org.freedesktop.DBus should return ALREADY_RUNNING."""
-    with tempfile.TemporaryDirectory(prefix="ssn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_start_dbus_daemon(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="ssn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_start_dbus_daemon(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_start_dbus_daemon(router_addr: str, test_log_dir: Path) -> dict:
@@ -136,29 +116,14 @@ async def _test_start_dbus_daemon(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_start_service_host_routed(test_log_dir: Path, build_project):
+def test_start_service_host_routed(test_log_dir: Path, router_env):
     """StartServiceByName for host-routed service should route to host bus."""
-    with tempfile.TemporaryDirectory(prefix="ssn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-[[host_routes]]
-destination = "org.test.HostService"
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_start_host_routed(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(HOST_ROUTE_CONFIG, socket_prefix="ssn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_start_host_routed(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_start_host_routed(router_addr: str, test_log_dir: Path) -> dict:

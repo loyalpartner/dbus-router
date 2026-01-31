@@ -6,36 +6,23 @@ Tests for RemoveMatch method which should:
 3. Properly rewrite sender in match rules with fake names
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType
 
-from utils.dbus_env import dbus_session, dbus_router_session
+EMPTY_CONFIG = ""
 
 
-def test_remove_match_basic(test_log_dir: Path, build_project):
+def test_remove_match_basic(test_log_dir: Path, router_env):
     """RemoveMatch should remove a previously added match rule."""
-    with tempfile.TemporaryDirectory(prefix="rm_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_remove_match_basic(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="rm_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_remove_match_basic(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_remove_match_basic(router_addr: str, test_log_dir: Path) -> dict:
@@ -80,26 +67,14 @@ async def _test_remove_match_basic(router_addr: str, test_log_dir: Path) -> dict
         return {"status": "exception", "error": str(e)}
 
 
-def test_remove_match_not_found(test_log_dir: Path, build_project):
+def test_remove_match_not_found(test_log_dir: Path, router_env):
     """RemoveMatch for non-existent rule should return error."""
-    with tempfile.TemporaryDirectory(prefix="rm_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_remove_match_not_found(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="rm_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_remove_match_not_found(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_remove_match_not_found(router_addr: str, test_log_dir: Path) -> dict:
@@ -137,26 +112,14 @@ async def _test_remove_match_not_found(router_addr: str, test_log_dir: Path) -> 
         return {"status": "exception", "error": str(e)}
 
 
-def test_remove_match_stops_signals(test_log_dir: Path, build_project):
+def test_remove_match_stops_signals(test_log_dir: Path, router_env):
     """After RemoveMatch, signals matching the rule should stop being received."""
-    with tempfile.TemporaryDirectory(prefix="rm_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_remove_match_stops_signals(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="rm_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_remove_match_stops_signals(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_remove_match_stops_signals(router_addr: str, test_log_dir: Path) -> dict:
@@ -264,26 +227,14 @@ async def _test_remove_match_stops_signals(router_addr: str, test_log_dir: Path)
         return {"status": "exception", "error": str(e)}
 
 
-def test_remove_match_with_sender(test_log_dir: Path, build_project):
+def test_remove_match_with_sender(test_log_dir: Path, router_env):
     """RemoveMatch with sender should have fake name rewritten."""
-    with tempfile.TemporaryDirectory(prefix="rm_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_remove_match_with_sender(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="rm_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_remove_match_with_sender(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_remove_match_with_sender(router_addr: str, test_log_dir: Path) -> dict:

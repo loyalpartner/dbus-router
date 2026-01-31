@@ -2,24 +2,21 @@
 
 import os
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
+from typing import Generator, NamedTuple, Optional, Tuple
 
 
-@contextmanager
-def dbus_session(socket_path: Path, log_dir: Path, name: str = "dbus"):
-    """Start a dbus-daemon session.
+class RouterTestEnv(NamedTuple):
+    host_addr: str
+    sandbox_addr: str
+    router_addr: str
 
-    Args:
-        socket_path: Path for the D-Bus socket
-        log_dir: Directory for log and config files
-        name: Name prefix for log files
 
-    Yields:
-        D-Bus address string (e.g., "unix:path=/tmp/dbus.sock")
-    """
+def _write_dbus_config(log_dir: Path, name: str, socket_path: Path) -> Path:
+    """Write dbus-daemon config file."""
     config = f"""<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
@@ -35,6 +32,58 @@ def dbus_session(socket_path: Path, log_dir: Path, name: str = "dbus"):
 """
     config_path = log_dir / f"{name}.conf"
     config_path.write_text(config)
+    return config_path
+
+
+def _router_command(
+    listen_path: Path,
+    host_addr: str,
+    sandbox_addr: str,
+    config_path: Path,
+    router_binary: Optional[Path],
+) -> list[str]:
+    router_path = router_binary or Path("target/release/dbus-router")
+    if router_path.exists():
+        return [
+            str(router_path),
+            "--listen",
+            str(listen_path),
+            "--host",
+            host_addr,
+            "--sandbox",
+            sandbox_addr,
+            "--config",
+            str(config_path),
+        ]
+    return [
+        "cargo",
+        "run",
+        "--release",
+        "--",
+        "--listen",
+        str(listen_path),
+        "--host",
+        host_addr,
+        "--sandbox",
+        sandbox_addr,
+        "--config",
+        str(config_path),
+    ]
+
+
+@contextmanager
+def dbus_session(socket_path: Path, log_dir: Path, name: str = "dbus"):
+    """Start a dbus-daemon session.
+
+    Args:
+        socket_path: Path for the D-Bus socket
+        log_dir: Directory for log and config files
+        name: Name prefix for log files
+
+    Yields:
+        D-Bus address string (e.g., "unix:path=/tmp/dbus.sock")
+    """
+    config_path = _write_dbus_config(log_dir, name, socket_path)
 
     stdout = open(log_dir / f"{name}.stdout", "w")
     stderr = open(log_dir / f"{name}.stderr", "w")
@@ -54,6 +103,32 @@ def dbus_session(socket_path: Path, log_dir: Path, name: str = "dbus"):
         stderr.close()
 
 
+@contextmanager
+def dbus_session_with_process(
+    socket_path: Path, log_dir: Path, name: str = "dbus"
+) -> Generator[Tuple[str, subprocess.Popen], None, None]:
+    """Start a dbus-daemon session and expose its process."""
+    config_path = _write_dbus_config(log_dir, name, socket_path)
+
+    stdout = open(log_dir / f"{name}.stdout", "w")
+    stderr = open(log_dir / f"{name}.stderr", "w")
+
+    proc = subprocess.Popen(
+        ["dbus-daemon", "--config-file", str(config_path), "--nofork"],
+        stdout=stdout,
+        stderr=stderr,
+    )
+    time.sleep(0.3)
+    try:
+        yield f"unix:path={socket_path}", proc
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+        stdout.close()
+        stderr.close()
+
+
 # Backwards compatibility alias
 sandbox_dbus_session = dbus_session
 
@@ -65,6 +140,7 @@ def dbus_router_session(
     sandbox_addr: str,
     config_path: Path,
     log_dir: Path,
+    router_binary: Optional[Path] = None,
 ):
     """Start the dbus-router under test.
 
@@ -85,20 +161,13 @@ def dbus_router_session(
     stderr = open(log_dir / "router.stderr", "w")
 
     proc = subprocess.Popen(
-        [
-            "cargo",
-            "run",
-            "--release",
-            "--",
-            "--listen",
-            str(listen_path),
-            "--host",
+        _router_command(
+            listen_path,
             host_addr,
-            "--sandbox",
             sandbox_addr,
-            "--config",
-            str(config_path),
-        ],
+            config_path,
+            router_binary,
+        ),
         stdout=stdout,
         stderr=stderr,
         env=env,
@@ -122,6 +191,43 @@ def dbus_router_session(
         proc.wait()
         stdout.close()
         stderr.close()
+
+
+@contextmanager
+def router_test_env(
+    config_text: str,
+    log_dir: Path,
+    *,
+    socket_prefix: str = "rt_",
+    router_binary: Optional[Path] = None,
+) -> Generator[RouterTestEnv, None, None]:
+    """Start host + sandbox buses and a router for a single test."""
+    with tempfile.TemporaryDirectory(prefix=socket_prefix) as sock_dir:
+        sock_path = Path(sock_dir)
+        host_dbus_socket = sock_path / "host.sock"
+        sandbox_dbus_socket = sock_path / "sandbox.sock"
+        router_socket = sock_path / "router.sock"
+
+        config_path = log_dir / "router.toml"
+        config_path.write_text(config_text or "")
+
+        with dbus_session(host_dbus_socket, log_dir, "host-dbus") as host_addr:
+            with dbus_session(
+                sandbox_dbus_socket, log_dir, "sandbox-dbus"
+            ) as sandbox_addr:
+                with dbus_router_session(
+                    router_socket,
+                    host_addr,
+                    sandbox_addr,
+                    config_path,
+                    log_dir,
+                    router_binary=router_binary,
+                ) as router_addr:
+                    yield RouterTestEnv(
+                        host_addr=host_addr,
+                        sandbox_addr=sandbox_addr,
+                        router_addr=router_addr,
+                    )
 
 
 @contextmanager

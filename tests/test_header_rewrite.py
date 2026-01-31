@@ -6,49 +6,36 @@ Tests for D-Bus message header field parsing and rewriting:
 - No warnings/errors when parsing messages with standard header fields
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType
 
-from utils.dbus_env import dbus_session, dbus_router_session
+EMPTY_CONFIG = """
+# Empty config - sandbox routing by default
+"""
 
 
-def test_sender_rewrite_in_method_return(test_log_dir: Path, build_project):
+def test_sender_rewrite_in_method_return(test_log_dir: Path, router_env):
     """SENDER field in method return should be properly rewritten.
 
     When calling a method through the router, the reply's SENDER
     should have the appropriate prefix (:h. or :s.).
     """
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# Empty config - sandbox routing by default
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_sender_in_reply(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
-                    # Check router logs for any warnings about header parsing
-                    router_log = test_log_dir / "router.stderr"
-                    if router_log.exists():
-                        log_content = router_log.read_text()
-                        # Should not have warnings about unknown header field types
-                        assert "Unknown header field type" not in log_content, \
-                            f"Found warning in router logs:\n{log_content}"
+    with router_env(EMPTY_CONFIG, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_sender_in_reply(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
+        # Check router logs for any warnings about header parsing
+        router_log = test_log_dir / "router.stderr"
+        if router_log.exists():
+            log_content = router_log.read_text()
+            # Should not have warnings about unknown header field types
+            assert "Unknown header field type" not in log_content, \
+                f"Found warning in router logs:\n{log_content}"
 
 
 async def _test_sender_in_reply(router_addr: str, test_log_dir: Path) -> dict:
@@ -92,7 +79,7 @@ async def _test_sender_in_reply(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_multiple_header_fields_parsing(test_log_dir: Path, build_project):
+def test_multiple_header_fields_parsing(test_log_dir: Path, router_env):
     """Messages with multiple header fields should be parsed correctly.
 
     Standard D-Bus messages have multiple header fields:
@@ -106,26 +93,12 @@ def test_multiple_header_fields_parsing(test_log_dir: Path, build_project):
 
     The router should handle all these types when scanning for SENDER/DESTINATION.
     """
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# Empty config
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_various_methods(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_various_methods(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_various_methods(router_addr: str, test_log_dir: Path) -> dict:
@@ -213,32 +186,18 @@ async def _test_various_methods(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_signal_sender_rewrite(test_log_dir: Path, build_project):
+def test_signal_sender_rewrite(test_log_dir: Path, router_env):
     """Signals should have their SENDER field properly rewritten.
 
     When a signal is emitted from the sandbox bus, the SENDER
     should have :s. prefix. When from host bus, :h. prefix.
     """
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# Empty config
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_signal_sender(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_signal_sender(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_signal_sender(router_addr: str, test_log_dir: Path) -> dict:
@@ -306,32 +265,18 @@ async def _test_signal_sender(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_introspect_with_complex_return(test_log_dir: Path, build_project):
+def test_introspect_with_complex_return(test_log_dir: Path, router_env):
     """Introspect returns large XML string, testing string handling.
 
     This exercises the router's ability to handle messages with
     large string payloads and verify header rewriting works correctly.
     """
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# Empty config
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_introspect(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_introspect(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_introspect(router_addr: str, test_log_dir: Path) -> dict:
@@ -384,46 +329,36 @@ async def _test_introspect(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_no_header_parse_warnings(test_log_dir: Path, build_project):
+def test_no_header_parse_warnings(test_log_dir: Path, router_env):
     """Router should not emit warnings about unknown header field types.
 
     After the header parsing fix, standard D-Bus messages should
     be processed without warnings in the router logs.
     """
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
+    config_text = '''
 # Test various routing scenarios
 [[host_routes]]
 destination = "org.test.HostService"
-''')
+'''
 
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_many_operations(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(config_text, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_many_operations(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
-                    # Check router logs for warnings
-                    router_log = test_log_dir / "router.stderr"
-                    if router_log.exists():
-                        log_content = router_log.read_text()
-                        # Should not have WARN level messages about header parsing
-                        warn_lines = [
-                            line for line in log_content.split("\n")
-                            if "WARN" in line and "header field" in line.lower()
-                        ]
-                        assert not warn_lines, \
-                            f"Found header field warnings in logs:\n" + "\n".join(warn_lines)
+        # Check router logs for warnings
+        router_log = test_log_dir / "router.stderr"
+        if router_log.exists():
+            log_content = router_log.read_text()
+            # Should not have WARN level messages about header parsing
+            warn_lines = [
+                line for line in log_content.split("\n")
+                if "WARN" in line and "header field" in line.lower()
+            ]
+            assert not warn_lines, \
+                f"Found header field warnings in logs:\n" + "\n".join(warn_lines)
 
 
 async def _test_many_operations(router_addr: str, test_log_dir: Path) -> dict:

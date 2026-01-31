@@ -8,36 +8,23 @@ D-Bus header flags (byte 2):
 - 0x2: NO_AUTO_START - Don't auto-start the destination service
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType, MessageFlag
 
-from utils.dbus_env import dbus_session, dbus_router_session
+EMPTY_CONFIG = ""
 
 
-def test_no_reply_expected_passthrough(test_log_dir: Path, build_project):
+def test_no_reply_expected_passthrough(test_log_dir: Path, router_env):
     """NO_REPLY_EXPECTED flag should be passed through to the bus."""
-    with tempfile.TemporaryDirectory(prefix="nre_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_no_reply_expected_passthrough(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="nre_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_no_reply_expected_passthrough(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_no_reply_expected_passthrough(router_addr: str, test_log_dir: Path) -> dict:
@@ -73,26 +60,14 @@ async def _test_no_reply_expected_passthrough(router_addr: str, test_log_dir: Pa
         return {"status": "exception", "error": str(e)}
 
 
-def test_no_reply_expected_with_side_effect(test_log_dir: Path, build_project):
+def test_no_reply_expected_with_side_effect(test_log_dir: Path, router_env):
     """NO_REPLY_EXPECTED message should still be processed (verify via side effect)."""
-    with tempfile.TemporaryDirectory(prefix="nre_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_no_reply_expected_side_effect(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="nre_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_no_reply_expected_side_effect(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_no_reply_expected_side_effect(router_addr: str, test_log_dir: Path) -> dict:
@@ -169,26 +144,14 @@ async def _test_no_reply_expected_side_effect(router_addr: str, test_log_dir: Pa
         return {"status": "exception", "error": str(e)}
 
 
-def test_compare_with_and_without_no_reply(test_log_dir: Path, build_project):
+def test_compare_with_and_without_no_reply(test_log_dir: Path, router_env):
     """Compare behavior with and without NO_REPLY_EXPECTED flag."""
-    with tempfile.TemporaryDirectory(prefix="nre_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_compare_with_and_without(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="nre_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_compare_with_and_without(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_compare_with_and_without(router_addr: str, test_log_dir: Path) -> dict:

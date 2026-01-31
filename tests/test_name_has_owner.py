@@ -6,36 +6,30 @@ Tests for NameHasOwner method which should:
 3. Handle fake unique names correctly
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType
 
-from utils.dbus_env import dbus_session, dbus_router_session, echo_service_session
+from utils.dbus_env import echo_service_session
+
+EMPTY_CONFIG = ""
+
+HOST_ROUTE_CONFIG = '''
+[[host_routes]]
+destination = "org.test.HostService"
+'''
 
 
-def test_name_has_owner_well_known(test_log_dir: Path, build_project):
+def test_name_has_owner_well_known(test_log_dir: Path, router_env):
     """NameHasOwner should return True for owned well-known names."""
-    with tempfile.TemporaryDirectory(prefix="nho_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_name_has_owner_well_known(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="nho_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_name_has_owner_well_known(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_name_has_owner_well_known(router_addr: str, test_log_dir: Path) -> dict:
@@ -88,27 +82,15 @@ async def _test_name_has_owner_well_known(router_addr: str, test_log_dir: Path) 
         return {"status": "exception", "error": str(e)}
 
 
-def test_name_has_owner_sandbox_service(test_log_dir: Path, build_project):
+def test_name_has_owner_sandbox_service(test_log_dir: Path, router_env):
     """NameHasOwner should return True for sandbox services."""
-    with tempfile.TemporaryDirectory(prefix="nho_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    with echo_service_session(router_addr, test_log_dir):
-                        result = asyncio.run(
-                            _test_name_has_owner_sandbox(router_addr, test_log_dir)
-                        )
-                        assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="nho_") as env:
+        _, _, router_addr = env
+        with echo_service_session(router_addr, test_log_dir):
+            result = asyncio.run(
+                _test_name_has_owner_sandbox(router_addr, test_log_dir)
+            )
+            assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_name_has_owner_sandbox(router_addr: str, test_log_dir: Path) -> dict:
@@ -143,26 +125,14 @@ async def _test_name_has_owner_sandbox(router_addr: str, test_log_dir: Path) -> 
         return {"status": "exception", "error": str(e)}
 
 
-def test_name_has_owner_org_freedesktop_dbus(test_log_dir: Path, build_project):
+def test_name_has_owner_org_freedesktop_dbus(test_log_dir: Path, router_env):
     """NameHasOwner should return True for org.freedesktop.DBus."""
-    with tempfile.TemporaryDirectory(prefix="nho_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_name_has_owner_dbus(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="nho_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_name_has_owner_dbus(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_name_has_owner_dbus(router_addr: str, test_log_dir: Path) -> dict:
@@ -202,29 +172,14 @@ async def _test_name_has_owner_dbus(router_addr: str, test_log_dir: Path) -> dic
         return {"status": "exception", "error": str(e)}
 
 
-def test_name_has_owner_host_routed(test_log_dir: Path, build_project):
+def test_name_has_owner_host_routed(test_log_dir: Path, router_env):
     """NameHasOwner for host-routed names should query host bus."""
-    with tempfile.TemporaryDirectory(prefix="nho_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-[[host_routes]]
-destination = "org.test.HostService"
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_name_has_owner_host_routed(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(HOST_ROUTE_CONFIG, socket_prefix="nho_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_name_has_owner_host_routed(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_name_has_owner_host_routed(router_addr: str, test_log_dir: Path) -> dict:
@@ -261,30 +216,18 @@ async def _test_name_has_owner_host_routed(router_addr: str, test_log_dir: Path)
         return {"status": "exception", "error": str(e)}
 
 
-def test_name_has_owner_fake_unique_name(test_log_dir: Path, build_project):
+def test_name_has_owner_fake_unique_name(test_log_dir: Path, router_env):
     """NameHasOwner should work for fake unique names (e.g., :s.1.0).
 
     This tests that the router correctly rewrites the body argument
     from :s.X.Y to :X.Y before querying the sandbox bus.
     """
-    with tempfile.TemporaryDirectory(prefix="nho_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_name_has_owner_fake_unique(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="nho_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_name_has_owner_fake_unique(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_name_has_owner_fake_unique(router_addr: str, test_log_dir: Path) -> dict:

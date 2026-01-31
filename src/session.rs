@@ -363,7 +363,7 @@ async fn handle_upstream_message(
             .header
             .destination
             .as_deref()
-                .map(|dest| match source_bus {
+            .map(|dest| match source_bus {
                 Bus::Host => ctx.exported_services.contains(dest),
                 Bus::Sandbox => ctx.sandbox_services.contains(dest),
             })

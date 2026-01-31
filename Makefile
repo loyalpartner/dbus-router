@@ -13,7 +13,7 @@ test-unit:
 
 # Run integration tests (Python)
 test-integration: build
-	cd tests && uv run pytest -v
+	cd tests && uv run pytest -v -n auto
 
 # Clean build artifacts
 clean:

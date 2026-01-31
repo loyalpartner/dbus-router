@@ -6,36 +6,23 @@ Tests for:
 3. NameOwnerChanged signal is sent when name is released
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType
 
-from utils.dbus_env import dbus_session, dbus_router_session
+EMPTY_CONFIG = ""
 
 
-def test_release_name_basic(test_log_dir: Path, build_project):
+def test_release_name_basic(test_log_dir: Path, router_env):
     """Client can release a name it owns."""
-    with tempfile.TemporaryDirectory(prefix="rn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_release_name_basic(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="rn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_release_name_basic(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_release_name_basic(router_addr: str, test_log_dir: Path) -> dict:
@@ -86,26 +73,14 @@ async def _test_release_name_basic(router_addr: str, test_log_dir: Path) -> dict
         return {"status": "exception", "error": str(e)}
 
 
-def test_release_name_name_lost_signal(test_log_dir: Path, build_project):
+def test_release_name_name_lost_signal(test_log_dir: Path, router_env):
     """NameLost signal should be received when releasing a name."""
-    with tempfile.TemporaryDirectory(prefix="rn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_name_lost_signal(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="rn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_name_lost_signal(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_name_lost_signal(router_addr: str, test_log_dir: Path) -> dict:
@@ -178,26 +153,14 @@ async def _test_name_lost_signal(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_release_name_owner_changed(test_log_dir: Path, build_project):
+def test_release_name_owner_changed(test_log_dir: Path, router_env):
     """NameOwnerChanged signal should be sent when name is released."""
-    with tempfile.TemporaryDirectory(prefix="rn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_release_owner_changed(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="rn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_release_owner_changed(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_release_owner_changed(router_addr: str, test_log_dir: Path) -> dict:
@@ -295,26 +258,14 @@ async def _test_release_owner_changed(router_addr: str, test_log_dir: Path) -> d
         return {"status": "exception", "error": str(e)}
 
 
-def test_release_name_not_owner(test_log_dir: Path, build_project):
+def test_release_name_not_owner(test_log_dir: Path, router_env):
     """ReleaseName for name we don't own should return NOT_OWNER."""
-    with tempfile.TemporaryDirectory(prefix="rn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_release_not_owner(router_addr)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="rn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_release_not_owner(router_addr)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_release_not_owner(router_addr: str) -> dict:

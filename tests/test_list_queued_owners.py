@@ -5,7 +5,6 @@ queued to own a name. The unique names should be rewritten with appropriate
 prefixes (:s. for sandbox, :h. for host).
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
@@ -18,29 +17,17 @@ DBUS_REQUEST_NAME_REPLY_IN_QUEUE = 2
 DBUS_REQUEST_NAME_REPLY_EXISTS = 3
 DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER = 4
 
-from utils.dbus_env import dbus_session, dbus_router_session
+EMPTY_CONFIG = ""
 
 
-def test_list_queued_owners_single_owner(test_log_dir: Path, build_project):
+def test_list_queued_owners_single_owner(test_log_dir: Path, router_env):
     """ListQueuedOwners should return single owner with correct prefix."""
-    with tempfile.TemporaryDirectory(prefix="lqo_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_list_queued_owners_single(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="lqo_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_list_queued_owners_single(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_list_queued_owners_single(router_addr: str, test_log_dir: Path) -> dict:
@@ -98,26 +85,14 @@ async def _test_list_queued_owners_single(router_addr: str, test_log_dir: Path) 
         return {"status": "exception", "error": str(e)}
 
 
-def test_list_queued_owners_multiple(test_log_dir: Path, build_project):
+def test_list_queued_owners_multiple(test_log_dir: Path, router_env):
     """ListQueuedOwners should return multiple queued owners with correct prefixes."""
-    with tempfile.TemporaryDirectory(prefix="lqo_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_list_queued_owners_multiple(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="lqo_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_list_queued_owners_multiple(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_list_queued_owners_multiple(router_addr: str, test_log_dir: Path) -> dict:
@@ -209,26 +184,14 @@ async def _test_list_queued_owners_multiple(router_addr: str, test_log_dir: Path
         return {"status": "exception", "error": str(e)}
 
 
-def test_list_queued_owners_nonexistent(test_log_dir: Path, build_project):
+def test_list_queued_owners_nonexistent(test_log_dir: Path, router_env):
     """ListQueuedOwners for non-existent name should return error."""
-    with tempfile.TemporaryDirectory(prefix="lqo_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_list_queued_owners_nonexistent(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="lqo_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_list_queued_owners_nonexistent(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_list_queued_owners_nonexistent(router_addr: str, test_log_dir: Path) -> dict:

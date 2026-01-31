@@ -7,36 +7,25 @@ Tests for advanced match rule features:
 4. arg0 - Match by first argument content
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType
 
-from utils.dbus_env import dbus_session, dbus_router_session, echo_service_session
+from utils.dbus_env import echo_service_session
+
+EMPTY_CONFIG = ""
 
 
-def test_match_rule_with_path(test_log_dir: Path, build_project):
+def test_match_rule_with_path(test_log_dir: Path, router_env):
     """Match rule with path should only receive signals from that path."""
-    with tempfile.TemporaryDirectory(prefix="mr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_match_rule_with_path(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="mr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_match_rule_with_path(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_match_rule_with_path(router_addr: str, test_log_dir: Path) -> dict:
@@ -85,26 +74,14 @@ async def _test_match_rule_with_path(router_addr: str, test_log_dir: Path) -> di
         return {"status": "exception", "error": str(e)}
 
 
-def test_match_rule_path_filters_signals(test_log_dir: Path, build_project):
+def test_match_rule_path_filters_signals(test_log_dir: Path, router_env):
     """Match rule with path should filter signals by path."""
-    with tempfile.TemporaryDirectory(prefix="mr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_match_rule_path_filters(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="mr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_match_rule_path_filters(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_match_rule_path_filters(router_addr: str, test_log_dir: Path) -> dict:
@@ -180,26 +157,14 @@ async def _test_match_rule_path_filters(router_addr: str, test_log_dir: Path) ->
         return {"status": "exception", "error": str(e)}
 
 
-def test_match_rule_with_destination(test_log_dir: Path, build_project):
+def test_match_rule_with_destination(test_log_dir: Path, router_env):
     """Match rule with destination should work correctly."""
-    with tempfile.TemporaryDirectory(prefix="mr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_match_rule_with_destination(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="mr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_match_rule_with_destination(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_match_rule_with_destination(router_addr: str, test_log_dir: Path) -> dict:
@@ -252,26 +217,14 @@ async def _test_match_rule_with_destination(router_addr: str, test_log_dir: Path
         return {"status": "exception", "error": str(e)}
 
 
-def test_match_rule_with_arg0(test_log_dir: Path, build_project):
+def test_match_rule_with_arg0(test_log_dir: Path, router_env):
     """Match rule with arg0 should filter by first argument."""
-    with tempfile.TemporaryDirectory(prefix="mr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_match_rule_with_arg0(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="mr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_match_rule_with_arg0(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_match_rule_with_arg0(router_addr: str, test_log_dir: Path) -> dict:
@@ -363,26 +316,14 @@ async def _test_match_rule_with_arg0(router_addr: str, test_log_dir: Path) -> di
         return {"status": "exception", "error": str(e)}
 
 
-def test_match_rule_combined(test_log_dir: Path, build_project):
+def test_match_rule_combined(test_log_dir: Path, router_env):
     """Match rule with multiple conditions should work correctly."""
-    with tempfile.TemporaryDirectory(prefix="mr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text("")
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_match_rule_combined(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(EMPTY_CONFIG, socket_prefix="mr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_match_rule_combined(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_match_rule_combined(router_addr: str, test_log_dir: Path) -> dict:

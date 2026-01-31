@@ -6,17 +6,27 @@ Tests for the fake unique name transformation:
 - Client sending to :h.1.45 gets routed to host with :1.45
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType
 
-from utils.dbus_env import dbus_session, dbus_router_session
+HOST_ROUTE_CONFIG = '''
+[[host_routes]]
+destination = "org.test.HostService"
+'''
+
+NO_HOST_ROUTE_CONFIG = '''
+# No host routes - org.freedesktop.DBus goes to sandbox
+'''
+
+NO_HOSTPASS_CONFIG = '''
+# No hostpass - Hello goes to sandbox
+'''
 
 
-def test_list_names_merges_both_buses(test_log_dir: Path, build_project):
+def test_list_names_merges_both_buses(test_log_dir: Path, router_env):
     """ListNames should return merged results from both buses with proper prefixes.
 
     Expected behavior:
@@ -24,27 +34,12 @@ def test_list_names_merges_both_buses(test_log_dir: Path, build_project):
     - Unique names from sandbox bus get :s. prefix
     - Well-known names are not prefixed and deduplicated
     """
-    with tempfile.TemporaryDirectory(prefix="fn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-[[host_routes]]
-destination = "org.test.HostService"
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_list_names_merge(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(HOST_ROUTE_CONFIG, socket_prefix="fn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_list_names_merge(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_list_names_merge(router_addr: str, test_log_dir: Path) -> dict:
@@ -88,35 +83,21 @@ async def _test_list_names_merge(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_get_name_owner_returns_prefixed_name(test_log_dir: Path, build_project):
+def test_get_name_owner_returns_prefixed_name(test_log_dir: Path, router_env):
     """GetNameOwner should return unique name with proper prefix.
 
     When asking for the owner of org.freedesktop.DBus on sandbox bus,
     the result should be :s.<unique_id> not just :<unique_id>
     """
-    with tempfile.TemporaryDirectory(prefix="fn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# No host routes - org.freedesktop.DBus goes to sandbox
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_get_name_owner(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
-                    # The owner should have :s. prefix (sandbox bus)
-                    owner = result.get("owner", "")
-                    assert owner.startswith(":s."), f"Expected :s. prefix, got: {owner}"
+    with router_env(NO_HOST_ROUTE_CONFIG, socket_prefix="fn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_get_name_owner(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
+        # The owner should have :s. prefix (sandbox bus)
+        owner = result.get("owner", "")
+        assert owner.startswith(":s."), f"Expected :s. prefix, got: {owner}"
 
 
 async def _test_get_name_owner(router_addr: str, test_log_dir: Path) -> dict:
@@ -165,34 +146,20 @@ async def _test_get_name_owner(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_hello_returns_prefixed_unique_name(test_log_dir: Path, build_project):
+def test_hello_returns_prefixed_unique_name(test_log_dir: Path, router_env):
     """Client's own unique name should have proper prefix.
 
     After Hello(), the client should see their unique name with :s. prefix
     (since Hello() goes to sandbox by default).
     """
-    with tempfile.TemporaryDirectory(prefix="fn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# No hostpass - Hello goes to sandbox
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_hello_unique_name(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
-                    unique_name = result.get("unique_name", "")
-                    assert unique_name.startswith(":s."), f"Expected :s. prefix, got: {unique_name}"
+    with router_env(NO_HOSTPASS_CONFIG, socket_prefix="fn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_hello_unique_name(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
+        unique_name = result.get("unique_name", "")
+        assert unique_name.startswith(":s."), f"Expected :s. prefix, got: {unique_name}"
 
 
 async def _test_hello_unique_name(router_addr: str, test_log_dir: Path) -> dict:
@@ -215,34 +182,19 @@ async def _test_hello_unique_name(router_addr: str, test_log_dir: Path) -> dict:
         return {"status": "exception", "error": str(e)}
 
 
-def test_get_name_owner_with_fake_unique_name(test_log_dir: Path, build_project):
+def test_get_name_owner_with_fake_unique_name(test_log_dir: Path, router_env):
     """GetNameOwner should work when querying a fake unique name.
 
     This tests that when client asks "who owns :h.1.38", the router
     correctly rewrites the body argument to ":1.38" before querying
     the host bus.
     """
-    with tempfile.TemporaryDirectory(prefix="fn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-[[host_routes]]
-destination = "org.test.HostService"
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_get_name_owner_fake_unique(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(HOST_ROUTE_CONFIG, socket_prefix="fn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_get_name_owner_fake_unique(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_get_name_owner_fake_unique(router_addr: str, test_log_dir: Path) -> dict:
@@ -296,32 +248,18 @@ async def _test_get_name_owner_fake_unique(router_addr: str, test_log_dir: Path)
         return {"status": "exception", "error": str(e)}
 
 
-def test_name_owner_changed_has_prefixed_names(test_log_dir: Path, build_project):
+def test_name_owner_changed_has_prefixed_names(test_log_dir: Path, router_env):
     """NameOwnerChanged signal should have prefixed unique names.
 
     When a service appears/disappears, the old_owner and new_owner
     fields should have proper :h. or :s. prefixes.
     """
-    with tempfile.TemporaryDirectory(prefix="fn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# Empty config
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_name_owner_changed(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(NO_HOST_ROUTE_CONFIG, socket_prefix="fn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_name_owner_changed(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_name_owner_changed(router_addr: str, test_log_dir: Path) -> dict:
@@ -396,33 +334,19 @@ async def _test_name_owner_changed(router_addr: str, test_log_dir: Path) -> dict
         return {"status": "exception", "error": str(e)}
 
 
-def test_get_connection_credentials_with_fake_unique_name(test_log_dir: Path, build_project):
+def test_get_connection_credentials_with_fake_unique_name(test_log_dir: Path, router_env):
     """GetConnectionCredentials should work when querying a fake unique name.
 
     When client asks for credentials of :s.1.23, the router should:
     1. Route to sandbox bus (based on :s. prefix)
     2. Rewrite body argument to :1.23
     """
-    with tempfile.TemporaryDirectory(prefix="fn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# Empty config
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_get_connection_credentials(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(NO_HOST_ROUTE_CONFIG, socket_prefix="fn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_get_connection_credentials(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_get_connection_credentials(router_addr: str, test_log_dir: Path) -> dict:
@@ -472,32 +396,18 @@ async def _test_get_connection_credentials(router_addr: str, test_log_dir: Path)
         return {"status": "exception", "error": str(e)}
 
 
-def test_list_queued_owners_with_fake_unique_name(test_log_dir: Path, build_project):
+def test_list_queued_owners_with_fake_unique_name(test_log_dir: Path, router_env):
     """ListQueuedOwners should work and return properly prefixed names.
 
     When we request a name and then query ListQueuedOwners,
     the returned owner should have the proper prefix.
     """
-    with tempfile.TemporaryDirectory(prefix="fn_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-# Empty config
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_list_queued_owners(router_addr, test_log_dir)
-                    )
-                    assert result["status"] == "success", f"Test failed: {result}"
+    with router_env(NO_HOST_ROUTE_CONFIG, socket_prefix="fn_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_list_queued_owners(router_addr, test_log_dir)
+        )
+        assert result["status"] == "success", f"Test failed: {result}"
 
 
 async def _test_list_queued_owners(router_addr: str, test_log_dir: Path) -> dict:

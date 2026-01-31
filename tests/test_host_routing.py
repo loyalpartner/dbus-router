@@ -7,17 +7,15 @@ This test file specifically tests scenarios where a client:
 This simulates the VSCode crash scenario where org.a11y.Bus was in host_routes.
 """
 
-import tempfile
 import asyncio
 from pathlib import Path
 
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType
 
-from utils.dbus_env import dbus_session, dbus_router_session
 
 
-def test_host_route_after_sandbox_hello(test_log_dir: Path, build_project):
+def test_host_route_after_sandbox_hello(test_log_dir: Path, router_env):
     """Client connects via router, then calls a host-routed service.
 
     This reproduces the VSCode crash scenario:
@@ -26,30 +24,20 @@ def test_host_route_after_sandbox_hello(test_log_dir: Path, build_project):
     3. Client calls org.test.HostService - routes to host bus
     4. Host bus rejects because it never received Hello() from router
     """
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        # Configure host_routes for org.test.HostService
-        # No hostpass - so Hello() will go to sandbox by default
-        config = test_log_dir / "router.toml"
-        config.write_text('''
+    # Configure host_routes for org.test.HostService
+    # No hostpass - so Hello() will go to sandbox by default
+    config_text = '''
 [[host_routes]]
 destination = "org.test.HostService"
-''')
+'''
 
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    # Run async test
-                    result = asyncio.run(
-                        _test_host_route_call(router_addr, test_log_dir)
-                    )
-                    assert result == "success", f"Test failed: {result}"
+    with router_env(config_text, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        # Run async test
+        result = asyncio.run(
+            _test_host_route_call(router_addr, test_log_dir)
+        )
+        assert result == "success", f"Test failed: {result}"
 
 
 async def _test_host_route_call(router_addr: str, test_log_dir: Path) -> str:
@@ -93,7 +81,7 @@ async def _test_host_route_call(router_addr: str, test_log_dir: Path) -> str:
             return f"unexpected_error: {error_str}"
 
 
-def test_mixed_sandbox_and_host_calls(test_log_dir: Path, build_project):
+def test_mixed_sandbox_and_host_calls(test_log_dir: Path, router_env):
     """Client makes calls to both sandbox and host routed services.
 
     This is a more comprehensive test:
@@ -104,30 +92,20 @@ def test_mixed_sandbox_and_host_calls(test_log_dir: Path, build_project):
 
     All calls should succeed (or return service-not-found, not disconnect).
     """
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
+    config_text = '''
 [[host_routes]]
 destination = "org.a11y.Bus"
 
 [[host_routes]]
 destination = "org.test.HostOnly"
-''')
+'''
 
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    result = asyncio.run(
-                        _test_mixed_calls(router_addr, test_log_dir)
-                    )
-                    assert result == "success", f"Test failed: {result}"
+    with router_env(config_text, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        result = asyncio.run(
+            _test_mixed_calls(router_addr, test_log_dir)
+        )
+        assert result == "success", f"Test failed: {result}"
 
 
 async def _test_mixed_calls(router_addr: str, test_log_dir: Path) -> str:
@@ -191,7 +169,7 @@ async def _test_mixed_calls(router_addr: str, test_log_dir: Path) -> str:
         return f"unexpected_error: {error_str}"
 
 
-def test_nameacquired_signal_not_leaked(test_log_dir: Path, build_project):
+def test_nameacquired_signal_not_leaked(test_log_dir: Path, router_env):
     """NameAcquired signal from host bus should not be forwarded to client.
 
     This test reproduces the NameAcquired signal issue:
@@ -205,34 +183,24 @@ def test_nameacquired_signal_not_leaked(test_log_dir: Path, build_project):
     The key timing here is that the client's Hello() response races with
     the stale NameAcquired signal from the host bus.
     """
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
+    config_text = '''
 [[host_routes]]
 destination = "org.test.HostService"
-''')
+'''
 
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    # Run multiple connections sequentially
-                    # Each triggers Router<->Host Hello() handshake
-                    errors = []
-                    for i in range(3):
-                        result = asyncio.run(
-                            _test_single_host_route_connection(router_addr, i, test_log_dir)
-                        )
-                        if result != "success":
-                            errors.append(f"Connection {i}: {result}")
+    with router_env(config_text, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        # Run multiple connections sequentially
+        # Each triggers Router<->Host Hello() handshake
+        errors = []
+        for i in range(3):
+            result = asyncio.run(
+                _test_single_host_route_connection(router_addr, i, test_log_dir)
+            )
+            if result != "success":
+                errors.append(f"Connection {i}: {result}")
 
-                    assert not errors, f"Connections failed: {errors}"
+        assert not errors, f"Connections failed: {errors}"
 
 
 async def _test_single_host_route_connection(
@@ -292,7 +260,7 @@ async def _test_single_host_route_connection(
         return f"connection_error: {error_str}"
 
 
-def test_no_stale_signal_after_connect(test_log_dir: Path, build_project):
+def test_no_stale_signal_after_connect(test_log_dir: Path, router_env):
     """Verify no stale signals are sent to client after connection.
 
     This is a low-level test that checks if any unexpected messages
@@ -301,28 +269,18 @@ def test_no_stale_signal_after_connect(test_log_dir: Path, build_project):
     import socket
     import struct
 
-    with tempfile.TemporaryDirectory(prefix="hr_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
+    config_text = '''
 [[host_routes]]
 destination = "org.test.HostService"
-''')
+'''
 
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    # Use dbus_next to connect (handles auth + Hello)
-                    result = asyncio.run(
-                        _check_for_stale_signals(router_addr, test_log_dir)
-                    )
-                    assert result == "success", f"Test failed: {result}"
+    with router_env(config_text, socket_prefix="hr_") as env:
+        _, _, router_addr = env
+        # Use dbus_next to connect (handles auth + Hello)
+        result = asyncio.run(
+            _check_for_stale_signals(router_addr, test_log_dir)
+        )
+        assert result == "success", f"Test failed: {result}"
 
 
 async def _check_for_stale_signals(router_addr: str, test_log_dir: Path) -> str:

@@ -16,7 +16,6 @@ Fix:
 """
 
 import asyncio
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -24,7 +23,15 @@ from dbus_next import Message, MessageType
 from dbus_next.aio import MessageBus
 from dbus_next.errors import DBusError
 
-from utils.dbus_env import dbus_session, dbus_router_session
+HOSTPASS_CONFIG = '''
+[[hostpass]]
+process = "*/python3*"
+'''
+
+HOST_ROUTE_CONFIG = '''
+[[host_routes]]
+destination = "org.test.HostService"
+'''
 
 
 async def _connect_and_get_unique_name(router_addr: str) -> str:
@@ -67,126 +74,83 @@ async def _connect_multiple_clients(router_addr: str, count: int) -> list:
     return unique_names
 
 
-def test_hostpass_hello_not_duplicated(test_log_dir: Path, build_project):
+def test_hostpass_hello_not_duplicated(test_log_dir: Path, router_env):
     """Hostpass client should not get 'Hello() already called' error.
 
     This test verifies that when a hostpass client connects to the router
     and sends Hello(), it doesn't get an error because the router should
     NOT have sent Hello() on the host bus for this client.
     """
-    with tempfile.TemporaryDirectory(prefix="hello_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        # Configure hostpass for python3 (our test client)
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-[[hostpass]]
-process = "*/python3*"
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    # Connect as a hostpass client - this should work
-                    # If the bug exists, this would fail with "Hello() already called"
-                    try:
-                        unique_name = asyncio.run(
-                            _connect_and_get_unique_name(router_addr)
-                        )
-                        # If we get here, Hello() succeeded
-                        assert unique_name is not None
-                        # Check for the "Already handled" error message in unique_name
-                        # (dbus-next may return error text as unique_name in some cases)
-                        if "already" in unique_name.lower() or "hello" in unique_name.lower():
-                            pytest.fail(
-                                f"Got 'Hello() already called' error - "
-                                f"router should not send Hello() for hostpass clients: {unique_name}"
-                            )
-                        assert unique_name.startswith(":"), f"Expected unique name starting with ':', got: {unique_name}"
-                    except DBusError as e:
-                        # This is the bug we're testing for
-                        if "already" in str(e).lower() or "hello" in str(e).lower():
-                            pytest.fail(
-                                f"Got 'Hello() already called' error - "
-                                f"router should not send Hello() for hostpass clients: {e}"
-                            )
-                        raise
+    with router_env(HOSTPASS_CONFIG, socket_prefix="hello_") as env:
+        _, _, router_addr = env
+        # Connect as a hostpass client - this should work
+        # If the bug exists, this would fail with "Hello() already called"
+        try:
+            unique_name = asyncio.run(
+                _connect_and_get_unique_name(router_addr)
+            )
+            # If we get here, Hello() succeeded
+            assert unique_name is not None
+            # Check for the "Already handled" error message in unique_name
+            # (dbus-next may return error text as unique_name in some cases)
+            if "already" in unique_name.lower() or "hello" in unique_name.lower():
+                pytest.fail(
+                    f"Got 'Hello() already called' error - "
+                    f"router should not send Hello() for hostpass clients: {unique_name}"
+                )
+            assert unique_name.startswith(":"), f"Expected unique name starting with ':', got: {unique_name}"
+        except DBusError as e:
+            # This is the bug we're testing for
+            if "already" in str(e).lower() or "hello" in str(e).lower():
+                pytest.fail(
+                    f"Got 'Hello() already called' error - "
+                    f"router should not send Hello() for hostpass clients: {e}"
+                )
+            raise
 
 
-def test_non_hostpass_can_use_host_routes(test_log_dir: Path, build_project):
+def test_non_hostpass_can_use_host_routes(test_log_dir: Path, router_env):
     """Non-hostpass client should be able to call host_routes services.
 
     This test verifies that for non-hostpass clients, the router sends
     Hello() on the host bus so that host_routes messages can be routed.
     """
-    with tempfile.TemporaryDirectory(prefix="hello_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        # No hostpass configured - python3 is a normal client
-        # But we configure org.freedesktop.DBus to route to host
-        config = test_log_dir / "router.toml"
-        config.write_text('''
+    config_text = '''
 [[host_routes]]
 destination = "org.freedesktop.DBus"
-''')
+'''
 
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    # Connect as non-hostpass client and call host bus
-                    # If router didn't send Hello(), host bus would disconnect
-                    try:
-                        names = asyncio.run(_call_list_names(router_addr))
-                        assert isinstance(names, list)
-                    except Exception as e:
-                        pytest.fail(
-                            f"Failed to call host bus - router should have sent Hello(): {e}"
-                        )
+    with router_env(config_text, socket_prefix="hello_") as env:
+        _, _, router_addr = env
+        # Connect as non-hostpass client and call host bus
+        # If router didn't send Hello(), host bus would disconnect
+        try:
+            names = asyncio.run(_call_list_names(router_addr))
+            assert isinstance(names, list)
+        except Exception as e:
+            pytest.fail(
+                f"Failed to call host bus - router should have sent Hello(): {e}"
+            )
 
 
-def test_multiple_hostpass_clients(test_log_dir: Path, build_project):
+def test_multiple_hostpass_clients(test_log_dir: Path, router_env):
     """Multiple hostpass clients should each get their own connection.
 
     Each hostpass client connection should work independently, with
     each client's Hello() being forwarded to the host bus.
     """
-    with tempfile.TemporaryDirectory(prefix="hello_") as sock_dir:
-        sock_path = Path(sock_dir)
-        host_dbus_socket = sock_path / "host.sock"
-        sandbox_dbus_socket = sock_path / "sandbox.sock"
-        router_socket = sock_path / "router.sock"
-
-        config = test_log_dir / "router.toml"
-        config.write_text('''
-[[hostpass]]
-process = "*/python3*"
-''')
-
-        with dbus_session(host_dbus_socket, test_log_dir, "host-dbus") as host_addr:
-            with dbus_session(sandbox_dbus_socket, test_log_dir, "sandbox-dbus") as sandbox_addr:
-                with dbus_router_session(
-                    router_socket, host_addr, sandbox_addr, config, test_log_dir
-                ) as router_addr:
-                    # Connect multiple clients
-                    try:
-                        unique_names = asyncio.run(
-                            _connect_multiple_clients(router_addr, 3)
-                        )
-                        # Each client should have a unique name
-                        assert len(set(unique_names)) == 3
-                    except DBusError as e:
-                        if "already called" in str(e).lower():
-                            pytest.fail(
-                                f"Got 'Hello() already called' error: {e}"
-                            )
-                        raise
+    with router_env(HOSTPASS_CONFIG, socket_prefix="hello_") as env:
+        _, _, router_addr = env
+        # Connect multiple clients
+        try:
+            unique_names = asyncio.run(
+                _connect_multiple_clients(router_addr, 3)
+            )
+            # Each client should have a unique name
+            assert len(set(unique_names)) == 3
+        except DBusError as e:
+            if "already called" in str(e).lower():
+                pytest.fail(
+                    f"Got 'Hello() already called' error: {e}"
+                )
+            raise
