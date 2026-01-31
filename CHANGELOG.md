@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/loyalpartner/dbus-router/compare/v0.8.0...v0.9.0) (2026-01-31)
+
+
+### Features
+
+* add dbus-monitor style message logging ([b6a2da0](https://github.com/loyalpartner/dbus-router/commit/b6a2da0a7eb2a0acba8a5dd6fd53aff70d887603))
+
+
+### Bug Fixes
+
+* route GetConnectionSELinux and GetAdtAudit by fake unique name ([459c17c](https://github.com/loyalpartner/dbus-router/commit/459c17c7f224de246ee9e0224e46f4ed780e86fe))
+
 ## [0.8.0](https://github.com/loyalpartner/dbus-router/compare/v0.7.0...v0.8.0) (2026-01-30)
 
 
