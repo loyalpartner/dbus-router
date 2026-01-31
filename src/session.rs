@@ -972,7 +972,11 @@ fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
         }
 
         // GetConnectionCredentials etc: route based on unique name argument
-        "GetConnectionCredentials" | "GetConnectionUnixUser" | "GetConnectionUnixProcessID" => {
+        "GetConnectionCredentials"
+        | "GetConnectionUnixUser"
+        | "GetConnectionUnixProcessID"
+        | "GetConnectionSELinuxSecurityContext"
+        | "GetAdtAuditSessionData" => {
             if let Some(name) = msg.extract_name_from_body() {
                 if let Some(bus) = get_bus_from_fake_name(&name) {
                     tracing::trace!(
