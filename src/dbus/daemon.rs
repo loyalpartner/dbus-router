@@ -5,11 +5,13 @@
 //! - GetNameOwner: rewrite unique name in response
 //! - NameOwnerChanged: rewrite unique names in signal body
 
-use crate::fake_name::{from_fake_name, is_unique_name, to_fake_name};
-use crate::message::{Endian, Message};
-use crate::message_rewrite::{parse_match_rule_sender, rewrite_match_rule_sender};
-use crate::session::Bus;
-use anyhow::{bail, Result};
+use super::message::{Endian, Message};
+use super::rewrite::{parse_match_rule, parse_match_rule_sender, rewrite_match_rule_sender};
+use crate::bus::Bus;
+use crate::config::Config;
+use crate::error::{Error, Result};
+use crate::fake_name::{from_fake_name, get_bus_from_fake_name, is_unique_name, to_fake_name};
+use crate::routing::RouteDecision;
 use zvariant::{
     serialized::{Context, Data},
     to_bytes, Endian as ZEndian, BE, LE,
@@ -29,9 +31,6 @@ pub const METHODS_NEED_REQUEST_REWRITE: &[&str] = &[
     "GetNameOwner",
 ];
 
-/// Methods that need result merging from both buses
-pub const METHODS_NEED_MERGE: &[&str] = &["ListNames", "ListActivatableNames"];
-
 /// Signals that need body rewriting
 pub const SIGNALS_NEED_REWRITE: &[&str] = &["NameOwnerChanged"];
 
@@ -45,14 +44,223 @@ pub fn needs_request_rewrite(member: &str) -> bool {
     METHODS_NEED_REQUEST_REWRITE.contains(&member)
 }
 
-/// Check if a method needs result merging
-pub fn needs_merge(member: &str) -> bool {
-    METHODS_NEED_MERGE.contains(&member)
-}
-
 /// Check if a signal needs body rewriting
 pub fn signal_needs_rewrite(member: &str) -> bool {
     SIGNALS_NEED_REWRITE.contains(&member)
+}
+
+/// Routing strategy for special org.freedesktop.DBus methods.
+#[derive(Debug, Clone, Copy)]
+pub enum DbusRouteKind {
+    /// Send to both and merge results.
+    MergeBoth,
+    /// Route based on match rule sender/interface.
+    ByMatchRule,
+    /// Route based on a name argument in the body.
+    ByName {
+        check_host_routes: bool,
+        allow_fake_unique: bool,
+    },
+}
+
+/// Table-driven spec for org.freedesktop.DBus methods.
+#[derive(Debug, Clone, Copy)]
+pub struct DbusMethodSpec {
+    pub member: &'static str,
+    pub route: DbusRouteKind,
+}
+
+pub const DBUS_METHOD_SPECS: &[DbusMethodSpec] = &[
+    DbusMethodSpec {
+        member: "AddMatch",
+        route: DbusRouteKind::ByMatchRule,
+    },
+    DbusMethodSpec {
+        member: "RemoveMatch",
+        route: DbusRouteKind::ByMatchRule,
+    },
+    DbusMethodSpec {
+        member: "RequestName",
+        route: DbusRouteKind::ByName {
+            check_host_routes: true,
+            allow_fake_unique: false,
+        },
+    },
+    DbusMethodSpec {
+        member: "ReleaseName",
+        route: DbusRouteKind::ByName {
+            check_host_routes: true,
+            allow_fake_unique: false,
+        },
+    },
+    DbusMethodSpec {
+        member: "GetNameOwner",
+        route: DbusRouteKind::ByName {
+            check_host_routes: true,
+            allow_fake_unique: true,
+        },
+    },
+    DbusMethodSpec {
+        member: "NameHasOwner",
+        route: DbusRouteKind::ByName {
+            check_host_routes: true,
+            allow_fake_unique: true,
+        },
+    },
+    DbusMethodSpec {
+        member: "StartServiceByName",
+        route: DbusRouteKind::ByName {
+            check_host_routes: true,
+            allow_fake_unique: true,
+        },
+    },
+    DbusMethodSpec {
+        member: "GetConnectionCredentials",
+        route: DbusRouteKind::ByName {
+            check_host_routes: false,
+            allow_fake_unique: true,
+        },
+    },
+    DbusMethodSpec {
+        member: "GetConnectionUnixUser",
+        route: DbusRouteKind::ByName {
+            check_host_routes: false,
+            allow_fake_unique: true,
+        },
+    },
+    DbusMethodSpec {
+        member: "GetConnectionUnixProcessID",
+        route: DbusRouteKind::ByName {
+            check_host_routes: false,
+            allow_fake_unique: true,
+        },
+    },
+    DbusMethodSpec {
+        member: "GetConnectionSELinuxSecurityContext",
+        route: DbusRouteKind::ByName {
+            check_host_routes: false,
+            allow_fake_unique: true,
+        },
+    },
+    DbusMethodSpec {
+        member: "GetAdtAuditSessionData",
+        route: DbusRouteKind::ByName {
+            check_host_routes: false,
+            allow_fake_unique: true,
+        },
+    },
+    DbusMethodSpec {
+        member: "ListNames",
+        route: DbusRouteKind::MergeBoth,
+    },
+    DbusMethodSpec {
+        member: "ListActivatableNames",
+        route: DbusRouteKind::MergeBoth,
+    },
+];
+
+pub fn find_method_spec(member: &str) -> Option<&'static DbusMethodSpec> {
+    DBUS_METHOD_SPECS.iter().find(|spec| spec.member == member)
+}
+
+/// Route org.freedesktop.DBus calls using table-driven rules.
+pub fn route_dbus_method(config: &Config, msg: &Message) -> RouteDecision {
+    let member = msg.header.member.as_deref().unwrap_or("");
+    let Some(spec) = find_method_spec(member) else {
+        return RouteDecision::Single(Bus::Sandbox);
+    };
+
+    match spec.route {
+        DbusRouteKind::MergeBoth => RouteDecision::Merge,
+        DbusRouteKind::ByMatchRule => {
+            if let Some(rule) = msg.extract_string_from_body() {
+                let info = parse_match_rule(&rule);
+
+                if let Some(ref sender) = info.sender {
+                    if let Some(bus) = get_bus_from_fake_name(sender) {
+                        tracing::trace!(
+                            member = member,
+                            sender = %sender,
+                            bus = ?bus,
+                            "Routing {} by fake sender name",
+                            member
+                        );
+                        return RouteDecision::Single(bus);
+                    }
+
+                    if config.should_route_to_host(sender) {
+                        tracing::trace!(
+                            member = member,
+                            sender = %sender,
+                            "Routing {} to host (sender in host_routes)",
+                            member
+                        );
+                        return RouteDecision::Single(Bus::Host);
+                    }
+                }
+
+                if let Some(ref interface) = info.interface {
+                    if let Some(service) = extract_service_from_interface(interface) {
+                        if config.should_route_to_host(&service) {
+                            tracing::trace!(
+                                member = member,
+                                interface = %interface,
+                                service = %service,
+                                "Routing {} to host (interface matches host_routes)",
+                                member
+                            );
+                            return RouteDecision::Single(Bus::Host);
+                        }
+                    }
+                }
+
+                tracing::trace!(
+                    member = member,
+                    rule = %rule,
+                    "Routing {} to both buses (no sender specified)",
+                    member
+                );
+                RouteDecision::Both
+            } else {
+                RouteDecision::Single(Bus::Sandbox)
+            }
+        }
+        DbusRouteKind::ByName {
+            check_host_routes,
+            allow_fake_unique,
+        } => {
+            if let Some(name) = msg.extract_name_from_body() {
+                if allow_fake_unique {
+                    if let Some(bus) = get_bus_from_fake_name(&name) {
+                        return RouteDecision::Single(bus);
+                    }
+                }
+
+                if check_host_routes && config.should_route_to_host(&name) {
+                    tracing::trace!(
+                        member = member,
+                        name = %name,
+                        "Routing {} to host (name in host_routes)",
+                        member
+                    );
+                    return RouteDecision::Single(Bus::Host);
+                }
+            }
+
+            RouteDecision::Single(Bus::Sandbox)
+        }
+    }
+}
+
+/// Extract service name from an interface string.
+/// e.g., "org.fcitx.Fcitx5.Controller1" -> "org.fcitx.Fcitx5"
+fn extract_service_from_interface(interface: &str) -> Option<String> {
+    let parts: Vec<&str> = interface.split('.').collect();
+    if parts.len() >= 3 {
+        Some(parts[..3].join("."))
+    } else {
+        None
+    }
 }
 
 /// Rewrite AddMatch/RemoveMatch body to remove fake prefix from sender.
@@ -162,7 +370,7 @@ pub fn rewrite_unique_name_request(msg: &Message) -> Result<(Vec<u8>, Bus)> {
     let body_start = msg.body_start();
 
     if body_start >= msg.raw.len() {
-        bail!("No body in message");
+        return Err(Error::Protocol("No body in message".to_string()));
     }
 
     // Parse the string from body
@@ -171,7 +379,7 @@ pub fn rewrite_unique_name_request(msg: &Message) -> Result<(Vec<u8>, Bus)> {
     let str_end = str_start + str_len;
 
     if str_end > msg.raw.len() {
-        bail!("Invalid string in body");
+        return Err(Error::Protocol("Invalid string in body".to_string()));
     }
 
     let name = String::from_utf8_lossy(&msg.raw[str_start..str_end]).to_string();
@@ -480,8 +688,11 @@ mod tests {
         assert!(needs_request_rewrite("GetNameOwner"));
         assert!(needs_request_rewrite("NameHasOwner"));
 
-        assert!(needs_merge("ListNames"));
-        assert!(!needs_merge("GetNameOwner"));
+        let list_spec = find_method_spec("ListNames").expect("ListNames spec");
+        assert!(matches!(list_spec.route, DbusRouteKind::MergeBoth));
+
+        let owner_spec = find_method_spec("GetNameOwner").expect("GetNameOwner spec");
+        assert!(!matches!(owner_spec.route, DbusRouteKind::MergeBoth));
 
         assert!(signal_needs_rewrite("NameOwnerChanged"));
         assert!(!signal_needs_rewrite("NameAcquired"));

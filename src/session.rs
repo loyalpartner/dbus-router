@@ -1,30 +1,25 @@
 //! Client session handling with dual upstream connections and routing
 
 use crate::auth;
+pub use crate::bus::Bus;
 use crate::config::Config;
-use crate::dbus_daemon::{
+use crate::conn::connect_dbus;
+use crate::dbus::daemon::{
     build_list_names_response, merge_list_names, needs_request_rewrite, needs_response_rewrite,
     parse_string_array, rewrite_match_rule_body, rewrite_name_owner_changed,
     rewrite_single_name_response, rewrite_string_array_response, rewrite_unique_name_request,
     signal_needs_rewrite,
 };
-use crate::fake_name::get_bus_from_fake_name;
-use crate::message::{self, read_message, Message, MessageType};
-use crate::message_format::format_message;
-use crate::message_rewrite::{parse_match_rule, rewrite_message_header, RewriteDirection};
-use anyhow::{bail, Result};
+use crate::dbus::format::format_message;
+use crate::dbus::message::{self, read_message, Message, MessageType};
+use crate::dbus::rewrite::{rewrite_message_header, RewriteDirection};
+use crate::error::{Error, Result};
+use crate::routing::{DefaultRouting, RouteDecision, RoutingStrategy};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
-
-/// Target bus for routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bus {
-    Host,
-    Sandbox,
-}
 
 /// Log a message with all relevant fields for debugging.
 fn log_message(msg: &Message, direction: &str, target: Option<Bus>) {
@@ -343,6 +338,71 @@ fn get_peer_exe_path(_stream: &UnixStream) -> Option<PathBuf> {
     None
 }
 
+struct UpstreamContext<'a> {
+    pending_merges: &'a mut HashMap<u32, PendingMerge>,
+    pending_calls: &'a HashMap<u32, PendingCallInfo>,
+    incoming_calls: &'a mut HashMap<u32, Bus>,
+    exported_services: &'a HashSet<String>,
+    sandbox_services: &'a HashSet<String>,
+}
+
+/// Handle a message from an upstream bus and forward to the client.
+async fn handle_upstream_message(
+    msg: Message,
+    source_bus: Bus,
+    client_write: &mut (impl AsyncWrite + Unpin),
+    ctx: &mut UpstreamContext<'_>,
+) -> Result<()> {
+    let (service_label, default_label, rewrite_sender_for_service) = match source_bus {
+        Bus::Host => ("Host->Client(exported)", "Host->Client", false),
+        Bus::Sandbox => ("Sandbox->Client(service)", "Sandbox->Client", true),
+    };
+
+    let is_service_call = msg.header.msg_type == MessageType::MethodCall
+        && msg
+            .header
+            .destination
+            .as_deref()
+                .map(|dest| match source_bus {
+                Bus::Host => ctx.exported_services.contains(dest),
+                Bus::Sandbox => ctx.sandbox_services.contains(dest),
+            })
+            .unwrap_or(false);
+
+    if is_service_call {
+        let mut msg_for_client = msg;
+        log_message(&msg_for_client, service_label, None);
+        ctx.incoming_calls
+            .insert(msg_for_client.header.serial, source_bus);
+
+        if rewrite_sender_for_service {
+            if let Err(e) =
+                rewrite_message_header(&mut msg_for_client, RewriteDirection::ToClient, source_bus)
+            {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to rewrite sender header for sandbox service call"
+                );
+            }
+        }
+
+        client_write.write_all(&msg_for_client.raw).await?;
+        return Ok(());
+    }
+
+    if let Some(result) = process_merge_response(&msg, source_bus, ctx.pending_merges) {
+        if let MergeResult::Complete(response) = result {
+            client_write.write_all(&response).await?;
+        }
+        return Ok(());
+    }
+
+    let msg_to_send = prepare_message_for_client(&msg, source_bus, ctx.pending_calls);
+    log_message(&msg, default_label, None);
+    client_write.write_all(&msg_to_send).await?;
+    Ok(())
+}
+
 impl Session {
     /// Create a new session with connections to both upstream buses.
     pub async fn new(
@@ -412,14 +472,17 @@ impl Session {
             .await?;
 
         // Read auth response
-        let response = read_auth_line(&mut self.host_bus).await?;
+        let response = auth::read_auth_line_string(&mut self.host_bus).await?;
         if !response.starts_with("OK") {
-            bail!("Host bus auth failed: {}", response.trim());
+            return Err(Error::Auth(format!(
+                "Host bus auth failed: {}",
+                response.trim()
+            )));
         }
 
         // Negotiate UNIX FD passing
         self.host_bus.write_all(b"NEGOTIATE_UNIX_FD\r\n").await?;
-        let response = read_auth_line(&mut self.host_bus).await?;
+        let response = auth::read_auth_line_string(&mut self.host_bus).await?;
         tracing::debug!(response = %response.trim(), "Host bus NEGOTIATE_UNIX_FD response");
 
         // Send BEGIN to complete SASL auth
@@ -478,10 +541,21 @@ impl Session {
                 tracing::debug!("Host bus Hello() MethodReturn received");
             }
             Some(resp) if resp.header.msg_type == MessageType::Error => {
-                bail!("Host bus Hello() failed with error")
+                return Err(Error::Protocol(
+                    "Host bus Hello() failed with error".to_string(),
+                ));
             }
-            Some(resp) => bail!("Unexpected response to Hello(): {:?}", resp.header.msg_type),
-            None => bail!("Host bus disconnected after Hello()"),
+            Some(resp) => {
+                return Err(Error::Protocol(format!(
+                    "Unexpected response to Hello(): {:?}",
+                    resp.header.msg_type
+                )));
+            }
+            None => {
+                return Err(Error::Protocol(
+                    "Host bus disconnected after Hello()".to_string(),
+                ));
+            }
         }
 
         // Then, read the NameAcquired signal
@@ -499,7 +573,11 @@ impl Session {
                     "Unexpected second message after Hello(), expected Signal"
                 );
             }
-            None => bail!("Host bus disconnected after Hello()"),
+            None => {
+                return Err(Error::Protocol(
+                    "Host bus disconnected after Hello()".to_string(),
+                ));
+            }
         }
 
         tracing::debug!("Host bus Hello() completed");
@@ -526,6 +604,7 @@ impl Session {
         // Track if sandbox bus is still active (for hostpass clients that survive sandbox disconnect)
         let mut sandbox_active = true;
 
+        let routing = DefaultRouting;
         loop {
             tokio::select! {
                 biased;
@@ -562,7 +641,11 @@ impl Session {
                                 }
                             }
 
-                            let decision = route_request(&self.config, &msg, self.client_exe_path.as_deref());
+                            let decision = routing.route(
+                                &self.config,
+                                &msg,
+                                self.client_exe_path.as_deref(),
+                            );
 
                             // Track RequestName calls to know which services this client exports
                             if msg.is_request_name() {
@@ -711,33 +794,20 @@ impl Session {
                 result = read_message(&mut host_read) => {
                     match result {
                         Ok(Some(msg)) => {
-                            // Check if this is a call to an exported service
-                            if msg.header.msg_type == MessageType::MethodCall {
-                                if let Some(ref dest) = msg.header.destination {
-                                    if self.exported_services.contains(dest) {
-                                        log_message(&msg, "Host->Client(exported)", None);
-                                        self.incoming_calls.insert(msg.header.serial, Bus::Host);
-                                        client_write.write_all(&msg.raw).await?;
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            // Check if this is a response to a pending merge request
-                            if let Some(result) = process_merge_response(&msg, Bus::Host, &mut self.pending_merges) {
-                                if let MergeResult::Complete(response) = result {
-                                    client_write.write_all(&response).await?;
-                                }
-                                continue;
-                            }
-
-                            let msg_to_send = prepare_message_for_client(
-                                &msg,
+                            let mut ctx = UpstreamContext {
+                                pending_merges: &mut self.pending_merges,
+                                pending_calls: &self.pending_calls,
+                                incoming_calls: &mut self.incoming_calls,
+                                exported_services: &self.exported_services,
+                                sandbox_services: &self.sandbox_services,
+                            };
+                            handle_upstream_message(
+                                msg,
                                 Bus::Host,
-                                &self.pending_calls,
-                            );
-                            log_message(&msg, "Host->Client", None);
-                            client_write.write_all(&msg_to_send).await?;
+                                &mut client_write,
+                                &mut ctx,
+                            )
+                            .await?;
                         }
                         Ok(None) => {
                             tracing::debug!("Host bus disconnected");
@@ -754,43 +824,20 @@ impl Session {
                 result = read_message(&mut sandbox_read), if sandbox_active => {
                     match result {
                         Ok(Some(msg)) => {
-                            // Check if this is a response to a pending merge request
-                            if let Some(result) = process_merge_response(&msg, Bus::Sandbox, &mut self.pending_merges) {
-                                if let MergeResult::Complete(response) = result {
-                                    client_write.write_all(&response).await?;
-                                }
-                                continue;
-                            }
-
-                            // Check if this is a call to a sandbox service registered by this client
-                            if msg.header.msg_type == MessageType::MethodCall {
-                                if let Some(ref dest) = msg.header.destination {
-                                    if self.sandbox_services.contains(dest) {
-                                        // Rewrite sender to add :s. prefix before forwarding to client
-                                        let mut msg_for_client = msg.clone();
-                                        if let Err(e) = rewrite_message_header(
-                                            &mut msg_for_client,
-                                            RewriteDirection::ToClient,
-                                            Bus::Sandbox,
-                                        ) {
-                                            tracing::warn!(error = %e, "Failed to rewrite sender header for sandbox service call");
-                                        }
-
-                                        log_message(&msg, "Sandbox->Client(service)", None);
-                                        self.incoming_calls.insert(msg.header.serial, Bus::Sandbox);
-                                        client_write.write_all(&msg_for_client.raw).await?;
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            let msg_to_send = prepare_message_for_client(
-                                &msg,
+                            let mut ctx = UpstreamContext {
+                                pending_merges: &mut self.pending_merges,
+                                pending_calls: &self.pending_calls,
+                                incoming_calls: &mut self.incoming_calls,
+                                exported_services: &self.exported_services,
+                                sandbox_services: &self.sandbox_services,
+                            };
+                            handle_upstream_message(
+                                msg,
                                 Bus::Sandbox,
-                                &self.pending_calls,
-                            );
-                            log_message(&msg, "Sandbox->Client", None);
-                            client_write.write_all(&msg_to_send).await?;
+                                &mut client_write,
+                                &mut ctx,
+                            )
+                            .await?;
                         }
                         Ok(None) => {
                             tracing::debug!("Sandbox bus disconnected");
@@ -815,324 +862,5 @@ impl Session {
                 }
             }
         }
-    }
-}
-
-/// Routing decision result
-#[derive(Debug, Clone)]
-pub enum RouteDecision {
-    /// Route to a single bus
-    Single(Bus),
-    /// Route to both buses (for AddMatch without sender)
-    Both,
-    /// Route to both buses and merge results (for ListNames)
-    Merge,
-}
-
-/// Determine which bus to route a request to based on destination.
-fn route_request(config: &Config, msg: &Message, client_exe: Option<&Path>) -> RouteDecision {
-    // Hostpass: route ALL messages from hostpass processes to host bus
-    // This is required because D-Bus requires Hello() before any other operations,
-    // and the host bus won't accept messages from connections that haven't called Hello()
-    if let Some(exe) = client_exe {
-        if config.has_hostpass(exe) {
-            tracing::trace!(exe = %exe.display(), "Routing to host (hostpass)");
-            return RouteDecision::Single(Bus::Host);
-        }
-    }
-
-    // Check if destination is a fake unique name (e.g., :h.1.45)
-    if let Some(ref dest) = msg.header.destination {
-        if let Some(bus) = get_bus_from_fake_name(dest) {
-            tracing::trace!(dest = %dest, bus = ?bus, "Routing by fake unique name");
-            return RouteDecision::Single(bus);
-        }
-    }
-
-    // Special handling for org.freedesktop.DBus methods
-    if msg.header.destination.as_deref() == Some("org.freedesktop.DBus")
-        && msg.header.interface.as_deref() == Some("org.freedesktop.DBus")
-    {
-        return route_dbus_daemon_call(config, msg);
-    }
-
-    // Method calls and signals with a destination are routed based on config
-    if let Some(ref dest) = msg.header.destination {
-        if config.should_route_to_host(dest) {
-            return RouteDecision::Single(Bus::Host);
-        }
-    }
-
-    // Default: route to sandbox bus
-    RouteDecision::Single(Bus::Sandbox)
-}
-
-/// Route calls to org.freedesktop.DBus based on method and arguments
-fn route_dbus_daemon_call(config: &Config, msg: &Message) -> RouteDecision {
-    let member = msg.header.member.as_deref().unwrap_or("");
-
-    match member {
-        // AddMatch/RemoveMatch: route based on sender in the match rule
-        "AddMatch" | "RemoveMatch" => {
-            if let Some(rule) = msg.extract_string_from_body() {
-                let info = parse_match_rule(&rule);
-
-                // If sender is specified, route based on sender
-                if let Some(ref sender) = info.sender {
-                    // Check if sender is a fake unique name
-                    if let Some(bus) = get_bus_from_fake_name(sender) {
-                        tracing::trace!(
-                            member = member,
-                            sender = %sender,
-                            bus = ?bus,
-                            "Routing {} by fake sender name",
-                            member
-                        );
-                        return RouteDecision::Single(bus);
-                    }
-
-                    // Check if sender matches host_routes
-                    if config.should_route_to_host(sender) {
-                        tracing::trace!(
-                            member = member,
-                            sender = %sender,
-                            "Routing {} to host (sender in host_routes)",
-                            member
-                        );
-                        return RouteDecision::Single(Bus::Host);
-                    }
-                }
-
-                // If interface is specified but no sender, try to route by interface
-                if let Some(ref interface) = info.interface {
-                    // Extract service name from interface (e.g., org.fcitx.Fcitx5.Controller1 -> org.fcitx.Fcitx5)
-                    if let Some(service) = extract_service_from_interface(interface) {
-                        if config.should_route_to_host(&service) {
-                            tracing::trace!(
-                                member = member,
-                                interface = %interface,
-                                service = %service,
-                                "Routing {} to host (interface matches host_routes)",
-                                member
-                            );
-                            return RouteDecision::Single(Bus::Host);
-                        }
-                    }
-                }
-
-                // No sender or interface to determine routing - send to both buses
-                tracing::trace!(
-                    member = member,
-                    rule = %rule,
-                    "Routing {} to both buses (no sender specified)",
-                    member
-                );
-                return RouteDecision::Both;
-            }
-
-            // Can't parse rule, default to sandbox
-            RouteDecision::Single(Bus::Sandbox)
-        }
-
-        // RequestName/ReleaseName: route based on the service name being registered
-        "RequestName" | "ReleaseName" => {
-            if let Some(name) = msg.extract_name_from_body() {
-                if config.should_route_to_host(&name) {
-                    tracing::trace!(
-                        member = member,
-                        name = %name,
-                        "Routing {} to host (name in host_routes)",
-                        member
-                    );
-                    return RouteDecision::Single(Bus::Host);
-                }
-            }
-            RouteDecision::Single(Bus::Sandbox)
-        }
-
-        // GetNameOwner/NameHasOwner/StartServiceByName: route based on queried name
-        "GetNameOwner" | "NameHasOwner" | "StartServiceByName" => {
-            if let Some(name) = msg.extract_name_from_body() {
-                // Check if name is a fake unique name
-                if let Some(bus) = get_bus_from_fake_name(&name) {
-                    return RouteDecision::Single(bus);
-                }
-
-                if config.should_route_to_host(&name) {
-                    tracing::trace!(
-                        member = member,
-                        name = %name,
-                        "Routing {} to host (name in host_routes)",
-                        member
-                    );
-                    return RouteDecision::Single(Bus::Host);
-                }
-            }
-            RouteDecision::Single(Bus::Sandbox)
-        }
-
-        // GetConnectionCredentials etc: route based on unique name argument
-        "GetConnectionCredentials"
-        | "GetConnectionUnixUser"
-        | "GetConnectionUnixProcessID"
-        | "GetConnectionSELinuxSecurityContext"
-        | "GetAdtAuditSessionData" => {
-            if let Some(name) = msg.extract_name_from_body() {
-                if let Some(bus) = get_bus_from_fake_name(&name) {
-                    tracing::trace!(
-                        member = member,
-                        name = %name,
-                        bus = ?bus,
-                        "Routing {} by fake unique name",
-                        member
-                    );
-                    return RouteDecision::Single(bus);
-                }
-            }
-            // Unknown unique name, default to sandbox
-            RouteDecision::Single(Bus::Sandbox)
-        }
-
-        // ListNames/ListActivatableNames: merge results from both buses
-        "ListNames" | "ListActivatableNames" => {
-            tracing::trace!(
-                member = member,
-                "Routing {} to both buses for merge",
-                member
-            );
-            RouteDecision::Merge
-        }
-
-        // Other methods: default to sandbox
-        _ => RouteDecision::Single(Bus::Sandbox),
-    }
-}
-
-/// Extract service name from an interface string.
-/// e.g., "org.fcitx.Fcitx5.Controller1" -> "org.fcitx.Fcitx5"
-fn extract_service_from_interface(interface: &str) -> Option<String> {
-    // Typically service name is the first 3 parts of the interface
-    // But this is heuristic - we try different lengths
-    let parts: Vec<&str> = interface.split('.').collect();
-    if parts.len() >= 3 {
-        // Try org.foo.Bar first (3 parts)
-        Some(parts[..3].join("."))
-    } else {
-        None
-    }
-}
-
-/// Parsed Unix socket address.
-#[derive(Debug, Clone)]
-enum UnixAddress {
-    /// Filesystem path socket
-    Path(std::path::PathBuf),
-    /// Abstract socket (Linux only)
-    Abstract(String),
-}
-
-/// Connect to a D-Bus address.
-/// Supports "unix:path=/path/to/socket" and "unix:abstract=name" formats.
-async fn connect_dbus(addr: &str) -> Result<UnixStream> {
-    let unix_addr = parse_unix_address(addr)?;
-    match unix_addr {
-        UnixAddress::Path(path) => {
-            tracing::debug!(path = %path.display(), "Connecting to D-Bus (path)");
-            let stream = UnixStream::connect(&path).await?;
-            Ok(stream)
-        }
-        UnixAddress::Abstract(name) => {
-            tracing::debug!(name = %name, "Connecting to D-Bus (abstract)");
-            let stream = connect_abstract(&name).await?;
-            Ok(stream)
-        }
-    }
-}
-
-/// Connect to an abstract Unix socket (Linux only).
-#[cfg(target_os = "linux")]
-async fn connect_abstract(name: &str) -> Result<UnixStream> {
-    use std::os::linux::net::SocketAddrExt;
-
-    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
-    let std_stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
-    std_stream.set_nonblocking(true)?;
-    let stream = UnixStream::from_std(std_stream)?;
-    Ok(stream)
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn connect_abstract(_name: &str) -> Result<UnixStream> {
-    bail!("Abstract sockets are only supported on Linux");
-}
-
-/// Read a single line from a D-Bus auth handshake (terminated by CRLF).
-async fn read_auth_line(stream: &mut UnixStream) -> Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let mut buf = [0u8; 256];
-    let mut response = Vec::new();
-    loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            bail!("Connection closed during auth");
-        }
-        response.extend_from_slice(&buf[..n]);
-        if response.windows(2).any(|w| w == b"\r\n") {
-            break;
-        }
-    }
-    Ok(String::from_utf8_lossy(&response).into_owned())
-}
-
-/// Parse a D-Bus address string to extract the Unix socket address.
-/// Supports formats:
-/// - unix:path=/path/to/socket
-/// - unix:abstract=name
-fn parse_unix_address(addr: &str) -> Result<UnixAddress> {
-    if !addr.starts_with("unix:") {
-        bail!("Only unix: addresses are supported, got: {}", addr);
-    }
-
-    let parts = &addr[5..]; // Skip "unix:"
-
-    for part in parts.split(',') {
-        if let Some(path) = part.strip_prefix("path=") {
-            return Ok(UnixAddress::Path(Path::new(path).to_path_buf()));
-        }
-        if let Some(name) = part.strip_prefix("abstract=") {
-            return Ok(UnixAddress::Abstract(name.to_string()));
-        }
-    }
-
-    bail!("No path= or abstract= found in address: {}", addr);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_unix_address_path() {
-        let addr = parse_unix_address("unix:path=/run/user/1000/bus").unwrap();
-        assert!(matches!(addr, UnixAddress::Path(p) if p == Path::new("/run/user/1000/bus")));
-
-        let addr = parse_unix_address("unix:path=/tmp/test.sock,guid=abc123").unwrap();
-        assert!(matches!(addr, UnixAddress::Path(p) if p == Path::new("/tmp/test.sock")));
-    }
-
-    #[test]
-    fn test_parse_unix_address_abstract() {
-        let addr = parse_unix_address("unix:abstract=/tmp/dbus-test").unwrap();
-        assert!(matches!(addr, UnixAddress::Abstract(n) if n == "/tmp/dbus-test"));
-
-        let addr = parse_unix_address("unix:abstract=dbus-session,guid=abc").unwrap();
-        assert!(matches!(addr, UnixAddress::Abstract(n) if n == "dbus-session"));
-    }
-
-    #[test]
-    fn test_parse_invalid_address() {
-        assert!(parse_unix_address("tcp:host=localhost").is_err());
-        assert!(parse_unix_address("unix:guid=abc123").is_err()); // no path or abstract
     }
 }

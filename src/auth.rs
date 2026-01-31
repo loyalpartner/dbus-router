@@ -6,7 +6,7 @@
 //! 3. Client may send NEGOTIATE_UNIX_FD to request FD passing capability
 //! 4. Client sends "BEGIN\r\n" to signal auth completion
 
-use anyhow::{bail, Result};
+use crate::error::{Error, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -25,10 +25,15 @@ pub async fn auth_passthrough(client: &mut UnixStream, bus: &mut UnixStream) -> 
     let mut null_byte = [0u8; 1];
     let n = client.read(&mut null_byte).await?;
     if n == 0 {
-        bail!("Client disconnected before sending null byte");
+        return Err(Error::Auth(
+            "Client disconnected before sending null byte".to_string(),
+        ));
     }
     if null_byte[0] != 0 {
-        bail!("Expected null byte, got: {}", null_byte[0]);
+        return Err(Error::Auth(format!(
+            "Expected null byte, got: {}",
+            null_byte[0]
+        )));
     }
     bus.write_all(&null_byte).await?;
     tracing::trace!("Forwarded null byte to bus");
@@ -53,7 +58,7 @@ pub async fn auth_passthrough(client: &mut UnixStream, bus: &mut UnixStream) -> 
             result = read_auth_line(client, &mut client_buf), if !begin_received => {
                 let line = result?;
                 if line.is_empty() {
-                    bail!("Client disconnected during auth");
+                    return Err(Error::Auth("Client disconnected during auth".to_string()));
                 }
 
                 tracing::trace!(line = %String::from_utf8_lossy(&line), "Client -> Bus");
@@ -78,7 +83,7 @@ pub async fn auth_passthrough(client: &mut UnixStream, bus: &mut UnixStream) -> 
             result = read_auth_line(bus, &mut bus_buf) => {
                 let line = result?;
                 if line.is_empty() {
-                    bail!("Bus disconnected during auth");
+                    return Err(Error::Auth("Bus disconnected during auth".to_string()));
                 }
 
                 tracing::trace!(line = %String::from_utf8_lossy(&line), "Bus -> Client");
@@ -103,7 +108,7 @@ async fn read_auth_line(stream: &mut UnixStream, buf: &mut [u8]) -> Result<Vec<u
 
     loop {
         if pos >= buf.len() {
-            bail!("Auth line too long");
+            return Err(Error::Auth("Auth line too long".to_string()));
         }
 
         let n = stream.read(&mut buf[pos..pos + 1]).await?;
@@ -122,6 +127,16 @@ async fn read_auth_line(stream: &mut UnixStream, buf: &mut [u8]) -> Result<Vec<u
             return Ok(result);
         }
     }
+}
+
+/// Read a line ending with \r\n and return it as a String.
+pub(crate) async fn read_auth_line_string(stream: &mut UnixStream) -> Result<String> {
+    let mut buf = vec![0u8; AUTH_BUFFER_SIZE];
+    let line = read_auth_line(stream, &mut buf).await?;
+    if line.is_empty() {
+        return Err(Error::Auth("Connection closed during auth".to_string()));
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
 }
 
 /// Check if a line is the BEGIN command.

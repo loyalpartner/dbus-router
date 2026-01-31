@@ -1,8 +1,7 @@
 //! Test binary for dbus-router library
 
-use anyhow::Result;
 use clap::Parser;
-use dbus_router::{Config, Router};
+use dbus_router::{Config, Result, Router};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]

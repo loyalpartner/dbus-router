@@ -3,8 +3,8 @@
 //! This module provides functions to format D-Bus messages in a style similar
 //! to `dbus-monitor`, making it easier to debug and understand message flow.
 
-use crate::message::{Endian, Message, MessageType};
-use crate::session::Bus;
+use super::message::{Endian, Message, MessageType};
+use crate::bus::Bus;
 use zvariant::{
     serialized::{Context, Data},
     Endian as ZEndian, Value,
@@ -276,7 +276,7 @@ fn format_value(value: &Value, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::MessageHeader;
+    use crate::dbus::message::MessageHeader;
 
     #[test]
     fn test_format_value_basic_types() {

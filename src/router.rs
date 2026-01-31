@@ -1,8 +1,8 @@
 //! Router core: listen for connections and spawn sessions
 
 use crate::config::Config;
+use crate::error::Result;
 use crate::session::Session;
-use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;

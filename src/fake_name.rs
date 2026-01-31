@@ -11,7 +11,7 @@
 //!
 //! Well-known names (e.g., `org.fcitx.Fcitx5`) are not transformed.
 
-use crate::session::Bus;
+use crate::bus::Bus;
 
 /// Prefix for host bus unique names
 pub const HOST_PREFIX: &str = ":h.";
@@ -27,7 +27,7 @@ pub const SANDBOX_PREFIX: &str = ":s.";
 ///
 /// ```
 /// use dbus_router::fake_name::to_fake_name;
-/// use dbus_router::session::Bus;
+/// use dbus_router::Bus;
 ///
 /// assert_eq!(to_fake_name(":1.45", Bus::Host), ":h.1.45");
 /// assert_eq!(to_fake_name(":1.23", Bus::Sandbox), ":s.1.23");
@@ -55,7 +55,7 @@ pub fn to_fake_name(real: &str, source: Bus) -> String {
 ///
 /// ```
 /// use dbus_router::fake_name::from_fake_name;
-/// use dbus_router::session::Bus;
+/// use dbus_router::Bus;
 ///
 /// assert_eq!(from_fake_name(":h.1.45"), Some((":1.45".to_string(), Bus::Host)));
 /// assert_eq!(from_fake_name(":s.1.23"), Some((":1.23".to_string(), Bus::Sandbox)));

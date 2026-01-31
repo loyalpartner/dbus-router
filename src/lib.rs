@@ -10,7 +10,7 @@
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
+//! async fn main() -> dbus_router::Result<()> {
 //!     let config = Config::default();
 //!     let router = Router::new(
 //!         PathBuf::from("/tmp/proxy.sock"),
@@ -23,16 +23,19 @@
 //! ```
 
 mod auth;
-mod message;
-mod message_format;
-mod message_rewrite;
+mod bus;
+mod conn;
+mod dbus;
+mod error;
+mod routing;
 
 pub mod config;
-pub mod dbus_daemon;
 pub mod fake_name;
 pub mod router;
 pub mod session;
 
 // Re-export main types
+pub use bus::Bus;
 pub use config::{Config, RouteRule};
+pub use error::{Error, Result};
 pub use router::Router;

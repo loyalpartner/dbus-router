@@ -9,7 +9,7 @@
 //! - bytes 8-11: serial (u32)
 //! - bytes 12+: header fields array (length + fields)
 
-use anyhow::{bail, Result};
+use crate::error::{Error, Result};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use zvariant::{serialized::Context, Endian as ZEndian, Value};
 
@@ -148,7 +148,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option
     let endian = match fixed_header[0] {
         b'l' => Endian::Little,
         b'B' => Endian::Big,
-        other => bail!("Invalid endian marker: {}", other),
+        other => return Err(Error::Protocol(format!("Invalid endian marker: {}", other))),
     };
 
     let msg_type = MessageType::from(fixed_header[1]);
@@ -156,14 +156,20 @@ pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option
     let protocol_version = fixed_header[3];
 
     if protocol_version != 1 {
-        bail!("Unsupported D-Bus protocol version: {}", protocol_version);
+        return Err(Error::Protocol(format!(
+            "Unsupported D-Bus protocol version: {}",
+            protocol_version
+        )));
     }
 
     let body_len = endian.read_u32(&fixed_header[4..8]);
     let serial = endian.read_u32(&fixed_header[8..12]);
 
     if body_len > MAX_MESSAGE_SIZE {
-        bail!("Message body too large: {} bytes", body_len);
+        return Err(Error::Protocol(format!(
+            "Message body too large: {} bytes",
+            body_len
+        )));
     }
 
     // Read header fields array length (4 bytes)
@@ -172,7 +178,10 @@ pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option
     let array_len = endian.read_u32(&array_len_buf);
 
     if array_len > MAX_MESSAGE_SIZE {
-        bail!("Header fields array too large: {} bytes", array_len);
+        return Err(Error::Protocol(format!(
+            "Header fields array too large: {} bytes",
+            array_len
+        )));
     }
 
     // Read header fields array

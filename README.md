@@ -134,7 +134,7 @@ use dbus_router::{Config, Router};
 use std::path::PathBuf;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> dbus_router::Result<()> {
     let config = Config::load(&PathBuf::from("router.toml"))?;
 
     let router = Router::new(

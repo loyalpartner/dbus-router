@@ -1,6 +1,6 @@
 //! Configuration file parsing for routing rules
 
-use anyhow::Result;
+use crate::error::Result;
 use glob::Pattern;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};

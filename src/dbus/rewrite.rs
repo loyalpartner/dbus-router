@@ -5,10 +5,10 @@
 
 #![allow(dead_code)] // Some functions are prepared for future use
 
+use super::message::{Endian, Message};
+use crate::bus::Bus;
+use crate::error::{Error, Result};
 use crate::fake_name::{from_fake_name, to_fake_name};
-use crate::message::{Endian, Message};
-use crate::session::Bus;
-use anyhow::{bail, Result};
 
 /// Direction of message flow for rewriting
 #[derive(Debug, Clone, Copy)]
@@ -164,7 +164,9 @@ fn rewrite_header_field(
             // Found the field - this is a string value
             // Read current string length
             if pos + 4 > raw.len() {
-                bail!("Invalid header field: truncated string length");
+                return Err(Error::Protocol(
+                    "Invalid header field: truncated string length".to_string(),
+                ));
             }
             let old_len = endian.read_u32(&raw[pos..]) as usize;
             let old_str_end = pos + 4 + old_len + 1; // length + string + null
@@ -590,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_header_field_sender() {
-        use crate::message::{MessageHeader, MessageType};
+        use crate::dbus::message::{MessageHeader, MessageType};
 
         // Build a minimal D-Bus message with sender ":1.45"
         // Format: fixed header (12 bytes) + array length (4 bytes) + header fields + padding + body
@@ -656,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_header_field_destination() {
-        use crate::message::{MessageHeader, MessageType};
+        use crate::dbus::message::{MessageHeader, MessageType};
 
         // Build a minimal D-Bus message with destination ":h.1.45"
         let mut raw = vec![
