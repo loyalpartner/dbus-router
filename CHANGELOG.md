@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/loyalpartner/dbus-router/compare/v0.10.0...v0.11.0) (2026-08-24)
+
+
+### Features
+
+* forward unix fds through the router ([fa576ea](https://github.com/loyalpartner/dbus-router/commit/fa576eaca144c5b855d9295aa0a6520ecf6bc765))
+
 ## [0.10.0](https://github.com/loyalpartner/dbus-router/compare/v0.9.0...v0.10.0) (2026-01-31)
 
 
