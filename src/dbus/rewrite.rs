@@ -384,58 +384,6 @@ fn rewrite_header_field(
     Ok(())
 }
 
-/// Information about how to rewrite body content for specific D-Bus methods
-#[derive(Debug)]
-pub struct BodyRewriteInfo {
-    /// Positions in the body that contain unique names (as strings)
-    pub unique_name_positions: Vec<BodyFieldPosition>,
-    /// Whether the first body argument is a match rule string that needs parsing
-    pub has_match_rule: bool,
-}
-
-#[derive(Debug)]
-pub enum BodyFieldPosition {
-    /// Simple string at given offset
-    StringAt(usize),
-    /// Array of strings starting at given offset
-    StringArray(usize),
-}
-
-/// Get rewrite information for org.freedesktop.DBus methods
-pub fn get_dbus_method_rewrite_info(member: &str) -> Option<BodyRewriteInfo> {
-    match member {
-        // Hello() -> s (unique name) - return value needs rewrite
-        "Hello" => Some(BodyRewriteInfo {
-            unique_name_positions: vec![BodyFieldPosition::StringAt(0)],
-            has_match_rule: false,
-        }),
-        // GetNameOwner(s) -> s (unique name) - return value needs rewrite
-        "GetNameOwner" => Some(BodyRewriteInfo {
-            unique_name_positions: vec![BodyFieldPosition::StringAt(0)],
-            has_match_rule: false,
-        }),
-        // ListNames() -> as (array of names) - return value needs rewrite
-        "ListNames" | "ListActivatableNames" | "ListQueuedOwners" => Some(BodyRewriteInfo {
-            unique_name_positions: vec![BodyFieldPosition::StringArray(0)],
-            has_match_rule: false,
-        }),
-        // AddMatch(s) / RemoveMatch(s) - match rule string needs parsing
-        "AddMatch" | "RemoveMatch" => Some(BodyRewriteInfo {
-            unique_name_positions: vec![],
-            has_match_rule: true,
-        }),
-        // GetConnectionCredentials(s), GetConnectionUnixUser(s), etc.
-        // The argument is a unique name that needs rewriting
-        "GetConnectionCredentials" | "GetConnectionUnixUser" | "GetConnectionUnixProcessID" => {
-            Some(BodyRewriteInfo {
-                unique_name_positions: vec![BodyFieldPosition::StringAt(0)],
-                has_match_rule: false,
-            })
-        }
-        _ => None,
-    }
-}
-
 /// Parse a D-Bus match rule string and extract the sender field
 pub fn parse_match_rule_sender(rule: &str) -> Option<String> {
     for part in rule.split(',') {
@@ -458,19 +406,6 @@ pub fn rewrite_match_rule_sender(rule: &str, old_sender: &str, new_sender: &str)
     let old_pattern = format!("sender='{}'", old_sender);
     let new_pattern = format!("sender='{}'", new_sender);
     rule.replace(&old_pattern, &new_pattern)
-}
-
-/// Parse a D-Bus match rule string and extract the interface field
-pub fn parse_match_rule_interface(rule: &str) -> Option<String> {
-    for part in rule.split(',') {
-        let part = part.trim();
-        if let Some(value) = part.strip_prefix("interface='") {
-            if let Some(value) = value.strip_suffix('\'') {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// Information extracted from a match rule for routing decisions
@@ -555,15 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_dbus_method_rewrite_info() {
-        assert!(get_dbus_method_rewrite_info("Hello").is_some());
-        assert!(get_dbus_method_rewrite_info("GetNameOwner").is_some());
-        assert!(get_dbus_method_rewrite_info("AddMatch").is_some());
-        assert!(get_dbus_method_rewrite_info("ListNames").is_some());
-        assert!(get_dbus_method_rewrite_info("SomeOtherMethod").is_none());
-    }
-
-    #[test]
     fn test_rewrite_match_rule_with_fake_sender() {
         // Test rewriting match rule with fake unique name
         let rule = "type='signal',sender=':h.1.45',interface='org.test'";
@@ -640,9 +566,14 @@ mod tests {
             member: None,
             path: None,
             signature: None,
+            unix_fds: None,
         };
 
-        let mut msg = Message { header, raw };
+        let mut msg = Message {
+            header,
+            raw,
+            fds: Vec::new(),
+        };
 
         // Rewrite sender to add :h. prefix
         let result = rewrite_message_header(&mut msg, RewriteDirection::ToClient, Bus::Host);
@@ -704,9 +635,14 @@ mod tests {
             member: None,
             path: None,
             signature: None,
+            unix_fds: None,
         };
 
-        let mut msg = Message { header, raw };
+        let mut msg = Message {
+            header,
+            raw,
+            fds: Vec::new(),
+        };
 
         // Rewrite destination to remove :h. prefix
         let result = rewrite_message_header(&mut msg, RewriteDirection::ToUpstream, Bus::Host);

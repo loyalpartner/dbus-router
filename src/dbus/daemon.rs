@@ -18,10 +18,10 @@ use zvariant::{
 };
 
 /// Methods that need response rewriting (unique name in return value)
-pub const METHODS_NEED_RESPONSE_REWRITE: &[&str] = &["Hello", "GetNameOwner", "ListQueuedOwners"];
+const METHODS_NEED_RESPONSE_REWRITE: &[&str] = &["Hello", "GetNameOwner", "ListQueuedOwners"];
 
 /// Methods that need request rewriting (unique name in argument)
-pub const METHODS_NEED_REQUEST_REWRITE: &[&str] = &[
+const METHODS_NEED_REQUEST_REWRITE: &[&str] = &[
     "GetConnectionCredentials",
     "GetConnectionUnixUser",
     "GetConnectionUnixProcessID",
@@ -32,7 +32,7 @@ pub const METHODS_NEED_REQUEST_REWRITE: &[&str] = &[
 ];
 
 /// Signals that need body rewriting
-pub const SIGNALS_NEED_REWRITE: &[&str] = &["NameOwnerChanged"];
+const SIGNALS_NEED_REWRITE: &[&str] = &["NameOwnerChanged"];
 
 /// Check if a method needs response rewriting
 pub fn needs_response_rewrite(member: &str) -> bool {
@@ -51,7 +51,7 @@ pub fn signal_needs_rewrite(member: &str) -> bool {
 
 /// Routing strategy for special org.freedesktop.DBus methods.
 #[derive(Debug, Clone, Copy)]
-pub enum DbusRouteKind {
+enum DbusRouteKind {
     /// Send to both and merge results.
     MergeBoth,
     /// Route based on match rule sender/interface.
@@ -65,12 +65,12 @@ pub enum DbusRouteKind {
 
 /// Table-driven spec for org.freedesktop.DBus methods.
 #[derive(Debug, Clone, Copy)]
-pub struct DbusMethodSpec {
+struct DbusMethodSpec {
     pub member: &'static str,
     pub route: DbusRouteKind,
 }
 
-pub const DBUS_METHOD_SPECS: &[DbusMethodSpec] = &[
+const DBUS_METHOD_SPECS: &[DbusMethodSpec] = &[
     DbusMethodSpec {
         member: "AddMatch",
         route: DbusRouteKind::ByMatchRule,
@@ -159,7 +159,7 @@ pub const DBUS_METHOD_SPECS: &[DbusMethodSpec] = &[
     },
 ];
 
-pub fn find_method_spec(member: &str) -> Option<&'static DbusMethodSpec> {
+fn find_method_spec(member: &str) -> Option<&'static DbusMethodSpec> {
     DBUS_METHOD_SPECS.iter().find(|spec| spec.member == member)
 }
 

@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::session::Session;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 
 /// The main router that listens for client connections.
 pub struct Router {
@@ -49,28 +49,43 @@ impl Router {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     tracing::info!("New client connection");
-
-                    let host_addr = self.host_addr.clone();
-                    let sandbox_addr = self.sandbox_addr.clone();
-                    let config = Arc::clone(&self.config);
-
-                    tokio::spawn(async move {
-                        match Session::new(stream, &host_addr, &sandbox_addr, config).await {
-                            Ok(session) => {
-                                if let Err(e) = session.run().await {
-                                    tracing::error!(error = %e, "Session error");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "Failed to create session");
-                            }
-                        }
-                    });
+                    tokio::spawn(serve_client(
+                        stream,
+                        self.host_addr.clone(),
+                        self.sandbox_addr.clone(),
+                        Arc::clone(&self.config),
+                    ));
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to accept connection");
-                }
+                // One client failing to connect must not take the router
+                // down; keep accepting.
+                Err(e) => tracing::error!(error = %e, "Failed to accept connection"),
             }
         }
+    }
+}
+
+/// Serve one accepted client until it disconnects. Errors are logged and
+/// end this task only - the accept loop above keeps running.
+async fn serve_client(
+    stream: UnixStream,
+    host_addr: String,
+    sandbox_addr: String,
+    config: Arc<Config>,
+) {
+    let session = match Session::new(stream, &host_addr, &sandbox_addr, config).await {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to create session");
+            return;
+        }
+    };
+
+    if let Err(e) = session.run().await {
+        tracing::error!(
+            error = %e,
+            host = %host_addr,
+            sandbox = %sandbox_addr,
+            "Session error"
+        );
     }
 }

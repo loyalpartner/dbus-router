@@ -18,20 +18,6 @@ pub enum RouteDecision {
     Merge,
 }
 
-/// Strategy trait for routing decisions.
-pub trait RoutingStrategy {
-    fn route(&self, config: &Config, msg: &Message, client_exe: Option<&Path>) -> RouteDecision;
-}
-
-/// Default routing strategy.
-pub struct DefaultRouting;
-
-impl RoutingStrategy for DefaultRouting {
-    fn route(&self, config: &Config, msg: &Message, client_exe: Option<&Path>) -> RouteDecision {
-        route_request(config, msg, client_exe)
-    }
-}
-
 /// Determine which bus to route a request to based on destination.
 pub fn route_request(config: &Config, msg: &Message, client_exe: Option<&Path>) -> RouteDecision {
     // Hostpass: route ALL messages from hostpass processes to host bus.
@@ -91,8 +77,10 @@ mod tests {
                 member: Some("ListNames".to_string()),
                 path: None,
                 signature: None,
+                unix_fds: None,
             },
             raw: vec![],
+            fds: Vec::new(),
         }
     }
 

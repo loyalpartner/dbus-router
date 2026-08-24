@@ -34,16 +34,10 @@ pub const SANDBOX_PREFIX: &str = ":s.";
 /// assert_eq!(to_fake_name("org.fcitx.Fcitx5", Bus::Host), "org.fcitx.Fcitx5");
 /// ```
 pub fn to_fake_name(real: &str, source: Bus) -> String {
-    // Only transform unique names (starting with ':')
-    if !real.starts_with(':') {
+    if !is_unique_name(real) {
         return real.to_string();
     }
-
-    let suffix = &real[1..]; // Remove leading ':'
-    match source {
-        Bus::Host => format!("{}{}", HOST_PREFIX, suffix),
-        Bus::Sandbox => format!("{}{}", SANDBOX_PREFIX, suffix),
-    }
+    format!("{}{}", fake_prefix(source), &real[1..]) // drop the leading ':'
 }
 
 /// Convert a fake unique name back to the real name and determine target bus.
@@ -63,12 +57,9 @@ pub fn to_fake_name(real: &str, source: Bus) -> String {
 /// assert_eq!(from_fake_name(":1.45"), None); // No prefix
 /// ```
 pub fn from_fake_name(fake: &str) -> Option<(String, Bus)> {
-    fake.strip_prefix(HOST_PREFIX)
-        .map(|suffix| (format!(":{}", suffix), Bus::Host))
-        .or_else(|| {
-            fake.strip_prefix(SANDBOX_PREFIX)
-                .map(|suffix| (format!(":{}", suffix), Bus::Sandbox))
-        })
+    let bus = get_bus_from_fake_name(fake)?;
+    let suffix = &fake[fake_prefix(bus).len()..];
+    Some((format!(":{}", suffix), bus))
 }
 
 /// Check if a name is a unique name (starts with ':').
@@ -78,12 +69,24 @@ pub fn is_unique_name(name: &str) -> bool {
 
 /// Check if a name is a fake unique name (has our prefix).
 pub fn is_fake_unique_name(name: &str) -> bool {
-    name.starts_with(HOST_PREFIX) || name.starts_with(SANDBOX_PREFIX)
+    get_bus_from_fake_name(name).is_some()
+}
+
+/// The prefix a bus's unique names carry once rewritten for the client.
+/// Sole owner of the bus-to-prefix mapping; everything else derives from
+/// this and from `get_bus_from_fake_name`.
+fn fake_prefix(bus: Bus) -> &'static str {
+    match bus {
+        Bus::Host => HOST_PREFIX,
+        Bus::Sandbox => SANDBOX_PREFIX,
+    }
 }
 
 /// Determine the target bus from a fake unique name.
 ///
-/// Returns `None` if the name is not a fake unique name.
+/// Returns `None` if the name is not a fake unique name. This is the single
+/// place that inspects prefixes; the predicates above are phrased in terms
+/// of it so a third bus would only need the two matches in this file.
 pub fn get_bus_from_fake_name(name: &str) -> Option<Bus> {
     if name.starts_with(HOST_PREFIX) {
         Some(Bus::Host)

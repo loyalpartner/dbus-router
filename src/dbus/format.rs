@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(format_value(&Value::Bool(true), 0), "boolean true");
         assert_eq!(format_value(&Value::I32(-123), 0), "int32 -123");
         assert_eq!(format_value(&Value::U32(456), 0), "uint32 456");
-        assert_eq!(format_value(&Value::F64(3.14), 0), "double 3.14");
+        assert_eq!(format_value(&Value::F64(2.5), 0), "double 2.5");
         assert_eq!(
             format_value(&Value::Str("hello".into()), 0),
             "string \"hello\""
@@ -316,8 +316,10 @@ mod tests {
                 member: Some("Hello".to_string()),
                 path: Some("/org/freedesktop/DBus".to_string()),
                 signature: None,
+                unix_fds: None,
             },
             raw: vec![],
+            fds: Vec::new(),
         };
 
         let formatted = format_message(&msg, "->", Some(Bus::Host));
@@ -346,8 +348,10 @@ mod tests {
                 member: None,
                 path: None,
                 signature: None,
+                unix_fds: None,
             },
             raw: vec![],
+            fds: Vec::new(),
         };
 
         let formatted = format_message(&msg, "<-", None);
@@ -372,8 +376,10 @@ mod tests {
                 member: Some("NameOwnerChanged".to_string()),
                 path: Some("/org/freedesktop/DBus".to_string()),
                 signature: None,
+                unix_fds: None,
             },
             raw: vec![],
+            fds: Vec::new(),
         };
 
         let formatted = format_message(&msg, "->", Some(Bus::Sandbox));

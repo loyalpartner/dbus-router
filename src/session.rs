@@ -11,14 +11,16 @@ use crate::dbus::daemon::{
     signal_needs_rewrite,
 };
 use crate::dbus::format::format_message;
-use crate::dbus::message::{self, read_message, Message, MessageType};
+use crate::dbus::message::{self, read_message_from, Message, MessageType};
 use crate::dbus::rewrite::{rewrite_message_header, RewriteDirection};
+use crate::dbus::socket::{dup_fd, DbusReader, DbusWriter};
 use crate::error::{Error, Result};
-use crate::routing::{DefaultRouting, RouteDecision, RoutingStrategy};
+use crate::routing::{route_request, RouteDecision};
 use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 /// Log a message with all relevant fields for debugging.
@@ -74,12 +76,12 @@ fn format_message_summary(msg: &Message) -> String {
 }
 
 /// Prepare a message from an upstream bus for forwarding to the client.
-/// Rewrites sender header and body as needed.
+/// Rewrites sender header and body as needed, preserving attached fds.
 fn prepare_message_for_client(
     msg: &Message,
     source_bus: Bus,
     pending_calls: &HashMap<u32, PendingCallInfo>,
-) -> Vec<u8> {
+) -> (Vec<u8>, Vec<Arc<std::os::fd::OwnedFd>>) {
     let mut msg_for_client = msg.clone();
 
     // Log message context for debugging header rewriting issues
@@ -109,13 +111,14 @@ fn prepare_message_for_client(
     }
 
     // Handle body rewriting based on message type
-    match msg_for_client.header.msg_type {
+    let raw = match msg_for_client.header.msg_type {
         MessageType::MethodReturn => {
             rewrite_method_return_body(&msg_for_client, source_bus, pending_calls)
         }
         MessageType::Signal => rewrite_signal_body(&msg_for_client, source_bus),
         _ => msg_for_client.raw,
-    }
+    };
+    (raw, msg.fds.clone())
 }
 
 /// Rewrite method return body if it contains unique names that need prefixing.
@@ -185,12 +188,14 @@ fn rewrite_signal_body(msg: &Message, source_bus: Bus) -> Vec<u8> {
     }
 }
 
-/// Result of processing a merge response.
-enum MergeResult {
-    /// First response stored, waiting for second
-    Stored,
-    /// Second response received, returns merged message bytes
-    Complete(Vec<u8>),
+/// What a reply arriving on an upstream bus means for a pending merge.
+enum MergeOutcome {
+    /// Not part of a merge - the caller handles the reply normally.
+    NotMerging,
+    /// First of the two replies; consumed, nothing to send yet.
+    Awaiting,
+    /// Both replies are in; send these bytes to the client.
+    Merged(Vec<u8>),
 }
 
 /// Process a ListNames/ListActivatableNames merge response.
@@ -199,9 +204,13 @@ fn process_merge_response(
     msg: &Message,
     source_bus: Bus,
     pending_merges: &mut HashMap<u32, PendingMerge>,
-) -> Option<MergeResult> {
-    let reply_serial = msg.header.reply_serial?;
-    let pending = pending_merges.get_mut(&reply_serial)?;
+) -> MergeOutcome {
+    let Some(reply_serial) = msg.header.reply_serial else {
+        return MergeOutcome::NotMerging;
+    };
+    let Some(pending) = pending_merges.get_mut(&reply_serial) else {
+        return MergeOutcome::NotMerging;
+    };
 
     let names = parse_string_array(msg).unwrap_or_default();
     tracing::trace!(
@@ -214,7 +223,7 @@ fn process_merge_response(
     let Some((first_bus, first_names)) = pending.first_response.take() else {
         // First response - store it
         pending.first_response = Some((source_bus, names));
-        return Some(MergeResult::Stored);
+        return MergeOutcome::Awaiting;
     };
 
     // Second response - merge and build final message
@@ -231,7 +240,9 @@ fn process_merge_response(
         "Merged ListNames response"
     );
 
-    let pending = pending_merges.remove(&reply_serial).unwrap();
+    let pending = pending_merges
+        .remove(&reply_serial)
+        .expect("entry was just resolved via get_mut");
     let response = match build_list_names_response(&pending.original_request, merged) {
         Ok(response) => response,
         Err(e) => {
@@ -240,7 +251,7 @@ fn process_merge_response(
         }
     };
 
-    Some(MergeResult::Complete(response))
+    MergeOutcome::Merged(response)
 }
 
 /// Pending merge state for ListNames/ListActivatableNames
@@ -338,69 +349,135 @@ fn get_peer_exe_path(_stream: &UnixStream) -> Option<PathBuf> {
     None
 }
 
-struct UpstreamContext<'a> {
-    pending_merges: &'a mut HashMap<u32, PendingMerge>,
-    pending_calls: &'a HashMap<u32, PendingCallInfo>,
-    incoming_calls: &'a mut HashMap<u32, Bus>,
-    exported_services: &'a HashSet<String>,
-    sandbox_services: &'a HashSet<String>,
+/// The two upstream writers a client's traffic can be routed to. Grouping
+/// them turns every "which bus does this go to" from a `match` at the call
+/// site into one lookup here.
+struct Upstreams {
+    host: DbusWriter,
+    sandbox: DbusWriter,
 }
 
-/// Handle a message from an upstream bus and forward to the client.
-async fn handle_upstream_message(
-    msg: Message,
-    source_bus: Bus,
-    client_write: &mut (impl AsyncWrite + Unpin),
-    ctx: &mut UpstreamContext<'_>,
-) -> Result<()> {
-    let (service_label, default_label, rewrite_sender_for_service) = match source_bus {
-        Bus::Host => ("Host->Client(exported)", "Host->Client", false),
-        Bus::Sandbox => ("Sandbox->Client(service)", "Sandbox->Client", true),
+impl Upstreams {
+    async fn send(&mut self, bus: Bus, raw: &[u8], fds: &[Arc<OwnedFd>]) -> Result<()> {
+        let writer = match bus {
+            Bus::Host => &mut self.host,
+            Bus::Sandbox => &mut self.sandbox,
+        };
+        writer.send(raw, fds).await?;
+        Ok(())
+    }
+
+    /// Send to both buses. SCM_RIGHTS duplicates the fds into each receiving
+    /// socket, so both upstreams get their own copy of every descriptor.
+    async fn send_both(&mut self, raw: &[u8], fds: &[Arc<OwnedFd>]) -> Result<()> {
+        self.host.send(raw, fds).await?;
+        self.sandbox.send(raw, fds).await?;
+        Ok(())
+    }
+}
+
+fn is_match_rule_member(member: &str) -> bool {
+    member == "AddMatch" || member == "RemoveMatch"
+}
+
+/// Match-rule body with the client's sender rewritten; the original bytes
+/// when there is nothing to rewrite, or when rewriting fails.
+fn match_rule_body_or_original(msg: &Message) -> Vec<u8> {
+    match rewrite_match_rule_body(msg) {
+        Ok(Some(rewritten)) => {
+            tracing::trace!("Rewrote match rule sender");
+            rewritten
+        }
+        Ok(None) => msg.raw.clone(),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to rewrite match rule");
+            msg.raw.clone()
+        }
+    }
+}
+
+/// Body rewrites that only apply to calls addressed to the bus daemon
+/// itself. Anything else - and any rewrite failure - forwards the original
+/// bytes unchanged.
+fn rewrite_request_body(msg: &Message) -> Vec<u8> {
+    if msg.header.destination.as_deref() != Some("org.freedesktop.DBus") {
+        return msg.raw.clone();
+    }
+    let Some(member) = msg.header.member.as_deref() else {
+        return msg.raw.clone();
     };
 
-    let is_service_call = msg.header.msg_type == MessageType::MethodCall
-        && msg
-            .header
-            .destination
-            .as_deref()
-            .map(|dest| match source_bus {
-                Bus::Host => ctx.exported_services.contains(dest),
-                Bus::Sandbox => ctx.sandbox_services.contains(dest),
-            })
-            .unwrap_or(false);
-
-    if is_service_call {
-        let mut msg_for_client = msg;
-        log_message(&msg_for_client, service_label, None);
-        ctx.incoming_calls
-            .insert(msg_for_client.header.serial, source_bus);
-
-        if rewrite_sender_for_service {
-            if let Err(e) =
-                rewrite_message_header(&mut msg_for_client, RewriteDirection::ToClient, source_bus)
-            {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to rewrite sender header for sandbox service call"
-                );
+    if needs_request_rewrite(member) {
+        return match rewrite_unique_name_request(msg) {
+            Ok((rewritten, _bus)) => {
+                tracing::trace!(member, "Rewrote request body to remove fake prefix");
+                rewritten
             }
-        }
-
-        client_write.write_all(&msg_for_client.raw).await?;
-        return Ok(());
+            Err(e) => {
+                tracing::warn!(member, error = %e, "Failed to rewrite request body");
+                msg.raw.clone()
+            }
+        };
     }
 
-    if let Some(result) = process_merge_response(&msg, source_bus, ctx.pending_merges) {
-        if let MergeResult::Complete(response) = result {
-            client_write.write_all(&response).await?;
-        }
-        return Ok(());
+    if is_match_rule_member(member) {
+        return match_rule_body_or_original(msg);
     }
 
-    let msg_to_send = prepare_message_for_client(&msg, source_bus, ctx.pending_calls);
-    log_message(&msg, default_label, None);
-    client_write.write_all(&msg_to_send).await?;
-    Ok(())
+    msg.raw.clone()
+}
+
+/// Log label for a call arriving from a bus into a service the client owns.
+fn service_call_label(bus: Bus) -> &'static str {
+    match bus {
+        Bus::Host => "Host->Client(exported)",
+        Bus::Sandbox => "Sandbox->Client(service)",
+    }
+}
+
+/// Log label for anything else a bus sends down to the client.
+fn forwarded_label(bus: Bus) -> &'static str {
+    match bus {
+        Bus::Host => "Host->Client",
+        Bus::Sandbox => "Sandbox->Client",
+    }
+}
+
+/// Log label for a reply the client sends back to a bus that called into it.
+fn reply_label(bus: Bus) -> &'static str {
+    match bus {
+        Bus::Host => "Client->Host(reply)",
+        Bus::Sandbox => "Client->Sandbox(reply)",
+    }
+}
+/// Wire bytes of the `Hello()` method call the router makes on the host bus
+/// on the client's behalf. Pure byte assembly, kept out of the send/await
+/// path so it can be exercised on its own.
+fn build_hello_call() -> Result<Vec<u8>> {
+    use zvariant::{serialized::Context, to_bytes, ObjectPath, Value, LE};
+
+    let path = ObjectPath::try_from("/org/freedesktop/DBus").expect("static path is valid");
+    let fields: Vec<(u8, Value)> = vec![
+        (1, Value::ObjectPath(path)),                   // PATH
+        (2, Value::Str("org.freedesktop.DBus".into())), // INTERFACE
+        (3, Value::Str("Hello".into())),                // MEMBER
+        (6, Value::Str("org.freedesktop.DBus".into())), // DESTINATION
+    ];
+
+    let fields_encoded = to_bytes(Context::new_dbus(LE, 12), &fields)?;
+    let array_len = fields_encoded.len() - 4; // Exclude 4-byte length prefix
+
+    // Body starts on an 8-byte boundary
+    let header_end = 16 + array_len;
+    let padding = (8 - (header_end % 8)) % 8;
+
+    let mut msg = Vec::with_capacity(header_end + padding);
+    msg.extend_from_slice(&[b'l', 1, 0, 1]); // endian, method_call, flags, version
+    msg.extend_from_slice(&0u32.to_le_bytes()); // body length
+    msg.extend_from_slice(&1u32.to_le_bytes()); // serial
+    msg.extend_from_slice(&fields_encoded);
+    msg.resize(msg.len() + padding, 0);
+    Ok(msg)
 }
 
 impl Session {
@@ -499,33 +576,7 @@ impl Session {
     /// Send Hello() method call to host bus and read the response.
     /// This registers the router's connection with the host bus daemon.
     async fn send_host_hello(&mut self) -> Result<()> {
-        use zvariant::{serialized::Context, to_bytes, ObjectPath, Value, LE};
-
-        // Build header fields array for Hello() call
-        let path = ObjectPath::try_from("/org/freedesktop/DBus").unwrap();
-        let fields: Vec<(u8, Value)> = vec![
-            (1, Value::ObjectPath(path)),                   // PATH
-            (2, Value::Str("org.freedesktop.DBus".into())), // INTERFACE
-            (3, Value::Str("Hello".into())),                // MEMBER
-            (6, Value::Str("org.freedesktop.DBus".into())), // DESTINATION
-        ];
-
-        let ctxt = Context::new_dbus(LE, 12);
-        let fields_encoded = to_bytes(ctxt, &fields)?;
-        let array_len = fields_encoded.len() - 4; // Exclude 4-byte length prefix
-
-        // Calculate padding to 8-byte boundary
-        let header_end = 16 + array_len;
-        let padding = (8 - (header_end % 8)) % 8;
-
-        // Build D-Bus message: fixed header + fields + padding
-        let mut msg = Vec::with_capacity(16 + array_len + padding);
-        msg.extend_from_slice(&[b'l', 1, 0, 1]); // endian, method_call, flags, version
-        msg.extend_from_slice(&0u32.to_le_bytes()); // body length
-        msg.extend_from_slice(&1u32.to_le_bytes()); // serial
-        msg.extend_from_slice(&fields_encoded);
-        msg.resize(msg.len() + padding, 0);
-
+        let msg = build_hello_call()?;
         self.host_bus.write_all(&msg).await?;
 
         // Read and validate response.
@@ -585,200 +636,234 @@ impl Session {
     }
 
     /// Forward messages between client and upstream buses with routing.
+    /// Handle a message from an upstream bus and forward it to the client.
+    async fn handle_upstream_message(
+        &mut self,
+        msg: Message,
+        source_bus: Bus,
+        client_write: &mut DbusWriter,
+    ) -> Result<()> {
+        if self.is_incoming_service_call(&msg, source_bus) {
+            let mut msg_for_client = msg;
+            log_message(&msg_for_client, service_call_label(source_bus), None);
+            self.incoming_calls
+                .insert(msg_for_client.header.serial, source_bus);
+
+            // Only sandbox peers are presented to the client under a fake
+            // unique name, so only they need their sender translated back.
+            if source_bus == Bus::Sandbox {
+                if let Err(e) = rewrite_message_header(
+                    &mut msg_for_client,
+                    RewriteDirection::ToClient,
+                    source_bus,
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to rewrite sender header for sandbox service call"
+                    );
+                }
+            }
+
+            client_write
+                .send(&msg_for_client.raw, &msg_for_client.fds)
+                .await?;
+            return Ok(());
+        }
+
+        match process_merge_response(&msg, source_bus, &mut self.pending_merges) {
+            MergeOutcome::NotMerging => {}
+            MergeOutcome::Awaiting => return Ok(()),
+            MergeOutcome::Merged(response) => {
+                client_write.send(&response, &[]).await?;
+                return Ok(());
+            }
+        }
+
+        let (msg_to_send, fds) = prepare_message_for_client(&msg, source_bus, &self.pending_calls);
+        log_message(&msg, forwarded_label(source_bus), None);
+        client_write.send(&msg_to_send, &fds).await?;
+        Ok(())
+    }
+
+    /// A call arriving FROM a bus, addressed to a name this client owns on
+    /// that same bus - as opposed to a reply to something the client sent.
+    fn is_incoming_service_call(&self, msg: &Message, source_bus: Bus) -> bool {
+        if msg.header.msg_type != MessageType::MethodCall {
+            return false;
+        }
+        let Some(dest) = msg.header.destination.as_deref() else {
+            return false;
+        };
+        match source_bus {
+            Bus::Host => self.exported_services.contains(dest),
+            Bus::Sandbox => self.sandbox_services.contains(dest),
+        }
+    }
+
+    /// A MethodReturn/Error answering a call that came IN from a bus goes
+    /// straight back to that bus, with the fake unique name in its
+    /// destination undone. Returns whether the message was consumed here.
+    async fn forward_reply_to_caller(
+        &mut self,
+        msg: &Message,
+        upstreams: &mut Upstreams,
+    ) -> Result<bool> {
+        if !matches!(
+            msg.header.msg_type,
+            MessageType::MethodReturn | MessageType::Error
+        ) {
+            return Ok(false);
+        }
+        let Some(reply_serial) = msg.header.reply_serial else {
+            return Ok(false);
+        };
+        let Some(source_bus) = self.incoming_calls.remove(&reply_serial) else {
+            return Ok(false);
+        };
+
+        let mut msg_for_bus = msg.clone();
+        if let Err(e) =
+            rewrite_message_header(&mut msg_for_bus, RewriteDirection::ToUpstream, source_bus)
+        {
+            tracing::warn!(error = %e, "Failed to rewrite destination for reply");
+        }
+        log_message(msg, reply_label(source_bus), Some(source_bus));
+        upstreams
+            .send(source_bus, &msg_for_bus.raw, &msg_for_bus.fds)
+            .await?;
+        Ok(true)
+    }
+
+    /// Remember which bus a RequestName went to, so a later call addressed
+    /// to that name can be recognised as an incoming service call.
+    fn track_exported_service(&mut self, msg: &Message, decision: &RouteDecision) {
+        if !msg.is_request_name() {
+            return;
+        }
+        let Some(name) = msg.extract_name_from_body() else {
+            return;
+        };
+        match decision {
+            RouteDecision::Single(Bus::Host) => {
+                tracing::info!(service = %name, "Client exporting service to host bus");
+                self.exported_services.insert(name);
+            }
+            RouteDecision::Single(Bus::Sandbox) => {
+                tracing::info!(service = %name, "Client registering service on sandbox bus");
+                self.sandbox_services.insert(name);
+            }
+            _ => {}
+        }
+    }
+
+    async fn forward_to_bus(
+        &mut self,
+        msg: Message,
+        target: Bus,
+        upstreams: &mut Upstreams,
+    ) -> Result<()> {
+        let mut msg_for_upstream = msg.clone();
+        if let Err(e) =
+            rewrite_message_header(&mut msg_for_upstream, RewriteDirection::ToUpstream, target)
+        {
+            tracing::warn!(error = %e, "Failed to rewrite destination header");
+        }
+        let raw = rewrite_request_body(&msg_for_upstream);
+
+        self.pending_calls.insert(
+            msg.header.serial,
+            PendingCallInfo {
+                bus: target,
+                member: msg.header.member.clone(),
+            },
+        );
+        log_message(&msg, "Client", Some(target));
+        upstreams.send(target, &raw, &msg.fds).await
+    }
+
+    /// AddMatch/RemoveMatch without a sender: both buses must see it.
+    async fn forward_to_both(&mut self, msg: Message, upstreams: &mut Upstreams) -> Result<()> {
+        let raw = match msg.header.member.as_deref() {
+            Some(member) if is_match_rule_member(member) => match_rule_body_or_original(&msg),
+            _ => msg.raw.clone(),
+        };
+
+        self.pending_calls.insert(
+            msg.header.serial,
+            PendingCallInfo {
+                bus: Bus::Sandbox,
+                member: msg.header.member.clone(),
+            },
+        );
+        log_message(&msg, "Client->Both", None);
+        upstreams.send_both(&raw, &msg.fds).await
+    }
+
+    /// ListNames/ListActivatableNames: ask both buses, merge the two replies.
+    async fn forward_for_merge(&mut self, msg: Message, upstreams: &mut Upstreams) -> Result<()> {
+        log_message(&msg, "Client->Merge", None);
+        self.pending_merges.insert(
+            msg.header.serial,
+            PendingMerge {
+                original_request: msg.clone(),
+                first_response: None,
+            },
+        );
+        upstreams.send_both(&msg.raw, &msg.fds).await
+    }
+
+    /// Route one client message to the upstream bus(es) it belongs on.
+    async fn handle_client_message(
+        &mut self,
+        msg: Message,
+        upstreams: &mut Upstreams,
+    ) -> Result<()> {
+        if self.forward_reply_to_caller(&msg, upstreams).await? {
+            return Ok(());
+        }
+
+        let decision = route_request(&self.config, &msg, self.client_exe_path.as_deref());
+        self.track_exported_service(&msg, &decision);
+
+        match decision {
+            RouteDecision::Single(target) => self.forward_to_bus(msg, target, upstreams).await,
+            RouteDecision::Both => self.forward_to_both(msg, upstreams).await,
+            RouteDecision::Merge => self.forward_for_merge(msg, upstreams).await,
+        }
+    }
+
+    /// Forward messages between client and upstream buses with routing.
     async fn forward_loop(mut self) -> Result<()> {
-        // Check if this is a hostpass client (they only use host bus)
+        // Hostpass clients only ever use the host bus, so they outlive the
+        // sandbox bus going away.
         let is_hostpass = self
             .client_exe_path
             .as_ref()
             .map(|p| self.config.has_hostpass(p))
             .unwrap_or(false);
 
-        let (client_read, mut client_write) = self.client.split();
-        let (host_read, mut host_write) = self.host_bus.split();
-        let (sandbox_read, mut sandbox_write) = self.sandbox_bus.split();
+        // Wrap each connection in fd-capable readers/writers: SCM_RIGHTS
+        // descriptors must be received and forwarded together with their
+        // message bytes. A unix socket is full-duplex, so we dup the single
+        // fd once per direction instead of splitting the stream.
+        let mut client_reader = DbusReader::new(dup_fd(self.client.as_fd())?)?;
+        let mut client_writer = DbusWriter::new(dup_fd(self.client.as_fd())?)?;
+        let mut host_reader = DbusReader::new(dup_fd(self.host_bus.as_fd())?)?;
+        let mut sandbox_reader = DbusReader::new(dup_fd(self.sandbox_bus.as_fd())?)?;
+        let mut upstreams = Upstreams {
+            host: DbusWriter::new(dup_fd(self.host_bus.as_fd())?)?,
+            sandbox: DbusWriter::new(dup_fd(self.sandbox_bus.as_fd())?)?,
+        };
 
-        let mut client_read = tokio::io::BufReader::new(client_read);
-        let mut host_read = tokio::io::BufReader::new(host_read);
-        let mut sandbox_read = tokio::io::BufReader::new(sandbox_read);
-
-        // Track if sandbox bus is still active (for hostpass clients that survive sandbox disconnect)
         let mut sandbox_active = true;
 
-        let routing = DefaultRouting;
         loop {
             tokio::select! {
                 biased;
-                // Read from client and route to appropriate bus
-                result = read_message(&mut client_read) => {
+
+                result = read_message_from(&mut client_reader) => {
                     match result {
-                        Ok(Some(msg)) => {
-                            // Check if this is a reply to an incoming call from upstream bus
-                            if matches!(msg.header.msg_type, MessageType::MethodReturn | MessageType::Error) {
-                                if let Some(reply_serial) = msg.header.reply_serial {
-                                    if let Some(source_bus) = self.incoming_calls.remove(&reply_serial) {
-                                        // Rewrite destination from fake name to real name
-                                        let mut msg_for_bus = msg.clone();
-                                        if let Err(e) = rewrite_message_header(
-                                            &mut msg_for_bus,
-                                            RewriteDirection::ToUpstream,
-                                            source_bus,
-                                        ) {
-                                            tracing::warn!(error = %e, "Failed to rewrite destination for reply");
-                                        }
-
-                                        match source_bus {
-                                            Bus::Host => {
-                                                log_message(&msg, "Client->Host(reply)", Some(Bus::Host));
-                                                host_write.write_all(&msg_for_bus.raw).await?;
-                                            }
-                                            Bus::Sandbox => {
-                                                log_message(&msg, "Client->Sandbox(reply)", Some(Bus::Sandbox));
-                                                sandbox_write.write_all(&msg_for_bus.raw).await?;
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            let decision = routing.route(
-                                &self.config,
-                                &msg,
-                                self.client_exe_path.as_deref(),
-                            );
-
-                            // Track RequestName calls to know which services this client exports
-                            if msg.is_request_name() {
-                                if let Some(name) = msg.extract_name_from_body() {
-                                    match decision {
-                                        RouteDecision::Single(Bus::Host) => {
-                                            tracing::info!(service = %name, "Client exporting service to host bus");
-                                            self.exported_services.insert(name);
-                                        }
-                                        RouteDecision::Single(Bus::Sandbox) => {
-                                            tracing::info!(service = %name, "Client registering service on sandbox bus");
-                                            self.sandbox_services.insert(name);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-
-                            match decision {
-                                RouteDecision::Single(target) => {
-                                    // Prepare message for sending to upstream
-                                    let mut msg_for_upstream = msg.clone();
-
-                                    // 1. Rewrite destination header if it's a fake unique name
-                                    if let Err(e) = rewrite_message_header(
-                                        &mut msg_for_upstream,
-                                        RewriteDirection::ToUpstream,
-                                        target, // source_bus not used for ToUpstream
-                                    ) {
-                                        tracing::warn!(error = %e, "Failed to rewrite destination header");
-                                    }
-
-                                    // 2. Rewrite body for org.freedesktop.DBus methods
-                                    let msg_to_send = if msg_for_upstream.header.destination.as_deref() == Some("org.freedesktop.DBus") {
-                                        if let Some(member) = msg_for_upstream.header.member.as_deref() {
-                                            if needs_request_rewrite(member) {
-                                                // Rewrite unique name in body (GetConnectionCredentials etc.)
-                                                match rewrite_unique_name_request(&msg_for_upstream) {
-                                                    Ok((rewritten, _bus)) => {
-                                                        tracing::trace!(
-                                                            member = member,
-                                                            "Rewrote request body to remove fake prefix"
-                                                        );
-                                                        rewritten
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            member = member,
-                                                            error = %e,
-                                                            "Failed to rewrite request body"
-                                                        );
-                                                        msg_for_upstream.raw.clone()
-                                                    }
-                                                }
-                                            } else if member == "AddMatch" || member == "RemoveMatch" {
-                                                // Rewrite sender in match rule
-                                                match rewrite_match_rule_body(&msg_for_upstream) {
-                                                    Ok(Some(rewritten)) => {
-                                                        tracing::trace!(
-                                                            member = member,
-                                                            "Rewrote match rule sender"
-                                                        );
-                                                        rewritten
-                                                    }
-                                                    Ok(None) => msg_for_upstream.raw.clone(),
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            member = member,
-                                                            error = %e,
-                                                            "Failed to rewrite match rule"
-                                                        );
-                                                        msg_for_upstream.raw.clone()
-                                                    }
-                                                }
-                                            } else {
-                                                msg_for_upstream.raw.clone()
-                                            }
-                                        } else {
-                                            msg_for_upstream.raw.clone()
-                                        }
-                                    } else {
-                                        msg_for_upstream.raw.clone()
-                                    };
-
-                                    self.pending_calls.insert(msg.header.serial, PendingCallInfo {
-                                        bus: target,
-                                        member: msg.header.member.clone(),
-                                    });
-                                    log_message(&msg, "Client", Some(target));
-
-                                    match target {
-                                        Bus::Host => host_write.write_all(&msg_to_send).await?,
-                                        Bus::Sandbox => sandbox_write.write_all(&msg_to_send).await?,
-                                    }
-                                }
-                                RouteDecision::Both => {
-                                    // Send to both buses (e.g., AddMatch without sender)
-                                    // Rewrite match rule body if needed
-                                    let msg_to_send = if msg.header.member.as_deref() == Some("AddMatch")
-                                        || msg.header.member.as_deref() == Some("RemoveMatch")
-                                    {
-                                        match rewrite_match_rule_body(&msg) {
-                                            Ok(Some(rewritten)) => rewritten,
-                                            Ok(None) => msg.raw.clone(),
-                                            Err(_) => msg.raw.clone(),
-                                        }
-                                    } else {
-                                        msg.raw.clone()
-                                    };
-
-                                    self.pending_calls.insert(msg.header.serial, PendingCallInfo {
-                                        bus: Bus::Sandbox,
-                                        member: msg.header.member.clone(),
-                                    });
-                                    log_message(&msg, "Client->Both", None);
-
-                                    host_write.write_all(&msg_to_send).await?;
-                                    sandbox_write.write_all(&msg_to_send).await?;
-                                }
-                                RouteDecision::Merge => {
-                                    // ListNames/ListActivatableNames: send to both and merge results
-                                    log_message(&msg, "Client->Merge", None);
-
-                                    self.pending_merges.insert(msg.header.serial, PendingMerge {
-                                        original_request: msg.clone(),
-                                        first_response: None,
-                                    });
-
-                                    host_write.write_all(&msg.raw).await?;
-                                    sandbox_write.write_all(&msg.raw).await?;
-                                }
-                            }
-                        }
+                        Ok(Some(msg)) => self.handle_client_message(msg, &mut upstreams).await?,
                         Ok(None) => {
                             tracing::debug!("Client disconnected");
                             return Ok(());
@@ -790,24 +875,11 @@ impl Session {
                     }
                 }
 
-                // Read from host bus and forward to client
-                result = read_message(&mut host_read) => {
+                result = read_message_from(&mut host_reader) => {
                     match result {
                         Ok(Some(msg)) => {
-                            let mut ctx = UpstreamContext {
-                                pending_merges: &mut self.pending_merges,
-                                pending_calls: &self.pending_calls,
-                                incoming_calls: &mut self.incoming_calls,
-                                exported_services: &self.exported_services,
-                                sandbox_services: &self.sandbox_services,
-                            };
-                            handle_upstream_message(
-                                msg,
-                                Bus::Host,
-                                &mut client_write,
-                                &mut ctx,
-                            )
-                            .await?;
+                            self.handle_upstream_message(msg, Bus::Host, &mut client_writer)
+                                .await?;
                         }
                         Ok(None) => {
                             tracing::debug!("Host bus disconnected");
@@ -820,43 +892,27 @@ impl Session {
                     }
                 }
 
-                // Read from sandbox bus and forward to client
-                result = read_message(&mut sandbox_read), if sandbox_active => {
+                result = read_message_from(&mut sandbox_reader), if sandbox_active => {
                     match result {
                         Ok(Some(msg)) => {
-                            let mut ctx = UpstreamContext {
-                                pending_merges: &mut self.pending_merges,
-                                pending_calls: &self.pending_calls,
-                                incoming_calls: &mut self.incoming_calls,
-                                exported_services: &self.exported_services,
-                                sandbox_services: &self.sandbox_services,
-                            };
-                            handle_upstream_message(
-                                msg,
-                                Bus::Sandbox,
-                                &mut client_write,
-                                &mut ctx,
-                            )
-                            .await?;
+                            self.handle_upstream_message(msg, Bus::Sandbox, &mut client_writer)
+                                .await?;
                         }
                         Ok(None) => {
                             tracing::debug!("Sandbox bus disconnected");
-                            if is_hostpass {
-                                // Hostpass clients only use host bus, so they can continue
-                                tracing::info!("Hostpass client continues after sandbox disconnect");
-                                sandbox_active = false;
-                                continue;
+                            if !is_hostpass {
+                                return Ok(());
                             }
-                            return Ok(());
+                            tracing::info!("Hostpass client continues after sandbox disconnect");
+                            sandbox_active = false;
                         }
                         Err(e) => {
                             tracing::debug!(error = %e, "Error reading from sandbox bus");
-                            if is_hostpass {
-                                tracing::info!("Hostpass client continues after sandbox read error");
-                                sandbox_active = false;
-                                continue;
+                            if !is_hostpass {
+                                return Ok(());
                             }
-                            return Ok(());
+                            tracing::info!("Hostpass client continues after sandbox read error");
+                            sandbox_active = false;
                         }
                     }
                 }

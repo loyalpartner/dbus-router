@@ -9,7 +9,10 @@
 //! - bytes 8-11: serial (u32)
 //! - bytes 12+: header fields array (length + fields)
 
+use super::socket::{self, DbusReader};
 use crate::error::{Error, Result};
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use zvariant::{serialized::Context, Endian as ZEndian, Value};
 
@@ -79,6 +82,8 @@ pub struct MessageHeader {
     pub member: Option<String>,
     pub path: Option<String>,
     pub signature: Option<String>,
+    /// Number of unix fds the message declares (header field 9).
+    pub unix_fds: Option<u32>,
 }
 
 /// A complete D-Bus message (header + body as raw bytes).
@@ -87,6 +92,10 @@ pub struct Message {
     pub header: MessageHeader,
     /// Raw message bytes including header and body
     pub raw: Vec<u8>,
+    /// File descriptors attached to this message via SCM_RIGHTS, in the order
+    /// the sender attached them. Shared via `Arc` so cloned/rewritten
+    /// messages can forward the same fds without duplicating them.
+    pub fds: Vec<Arc<OwnedFd>>,
 }
 
 impl Message {
@@ -135,92 +144,83 @@ impl Message {
 }
 
 /// Read a complete D-Bus message from the stream.
-pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option<Message>> {
-    // Read fixed header (12 bytes)
-    let mut fixed_header = [0u8; FIXED_HEADER_SIZE];
-    match stream.read_exact(&mut fixed_header).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
+/// The fixed 16-byte prologue every D-Bus message starts with: the 12-byte
+/// fixed header plus the length of the header-fields array. Parsed in one
+/// place so the two readers below cannot drift apart on protocol details.
+struct Prologue {
+    endian: Endian,
+    msg_type: MessageType,
+    flags: u8,
+    serial: u32,
+    body_len: u32,
+    array_len: usize,
+}
 
-    // Parse endian
-    let endian = match fixed_header[0] {
-        b'l' => Endian::Little,
-        b'B' => Endian::Big,
-        other => return Err(Error::Protocol(format!("Invalid endian marker: {}", other))),
-    };
+impl Prologue {
+    /// `head` must hold at least `MIN_HEADER_SIZE` bytes.
+    fn parse(head: &[u8]) -> Result<Self> {
+        let endian = match head[0] {
+            b'l' => Endian::Little,
+            b'B' => Endian::Big,
+            other => return Err(Error::Protocol(format!("Invalid endian marker: {}", other))),
+        };
 
-    let msg_type = MessageType::from(fixed_header[1]);
-    let flags = fixed_header[2];
-    let protocol_version = fixed_header[3];
+        let protocol_version = head[3];
+        if protocol_version != 1 {
+            return Err(Error::Protocol(format!(
+                "Unsupported D-Bus protocol version: {}",
+                protocol_version
+            )));
+        }
 
-    if protocol_version != 1 {
-        return Err(Error::Protocol(format!(
-            "Unsupported D-Bus protocol version: {}",
-            protocol_version
-        )));
-    }
+        let body_len = endian.read_u32(&head[4..8]);
+        if body_len > MAX_MESSAGE_SIZE {
+            return Err(Error::Protocol(format!(
+                "Message body too large: {} bytes",
+                body_len
+            )));
+        }
 
-    let body_len = endian.read_u32(&fixed_header[4..8]);
-    let serial = endian.read_u32(&fixed_header[8..12]);
+        let array_len = endian.read_u32(&head[12..16]);
+        if array_len > MAX_MESSAGE_SIZE {
+            return Err(Error::Protocol(format!(
+                "Header fields array too large: {} bytes",
+                array_len
+            )));
+        }
 
-    if body_len > MAX_MESSAGE_SIZE {
-        return Err(Error::Protocol(format!(
-            "Message body too large: {} bytes",
-            body_len
-        )));
-    }
-
-    // Read header fields array length (4 bytes)
-    let mut array_len_buf = [0u8; 4];
-    stream.read_exact(&mut array_len_buf).await?;
-    let array_len = endian.read_u32(&array_len_buf);
-
-    if array_len > MAX_MESSAGE_SIZE {
-        return Err(Error::Protocol(format!(
-            "Header fields array too large: {} bytes",
-            array_len
-        )));
-    }
-
-    // Read header fields array
-    let mut fields_buf = vec![0u8; array_len as usize];
-    stream.read_exact(&mut fields_buf).await?;
-
-    // Calculate padding to 8-byte boundary after header
-    let header_end = MIN_HEADER_SIZE + array_len as usize;
-    let padding = (8 - (header_end % 8)) % 8;
-    let mut padding_buf = vec![0u8; padding];
-    if padding > 0 {
-        stream.read_exact(&mut padding_buf).await?;
-    }
-
-    // Read body
-    let mut body = vec![0u8; body_len as usize];
-    if body_len > 0 {
-        stream.read_exact(&mut body).await?;
-    }
-
-    // Parse header fields
-    let fields = parse_header_fields(&fields_buf, endian)?;
-
-    // Reconstruct raw message
-    let total_len = FIXED_HEADER_SIZE + 4 + array_len as usize + padding + body_len as usize;
-    let mut raw = Vec::with_capacity(total_len);
-    raw.extend_from_slice(&fixed_header);
-    raw.extend_from_slice(&array_len_buf);
-    raw.extend_from_slice(&fields_buf);
-    raw.extend_from_slice(&padding_buf);
-    raw.extend_from_slice(&body);
-
-    Ok(Some(Message {
-        header: MessageHeader {
+        Ok(Self {
             endian,
-            msg_type,
-            flags,
-            serial,
+            msg_type: MessageType::from(head[1]),
+            flags: head[2],
+            serial: endian.read_u32(&head[8..12]),
             body_len,
+            array_len: array_len as usize,
+        })
+    }
+
+    /// Offset just past the header-fields array.
+    fn header_end(&self) -> usize {
+        MIN_HEADER_SIZE + self.array_len
+    }
+
+    /// Padding that aligns the body to an 8-byte boundary.
+    fn padding(&self) -> usize {
+        (8 - (self.header_end() % 8)) % 8
+    }
+
+    /// Total wire size of the message.
+    fn total_len(&self) -> usize {
+        self.header_end() + self.padding() + self.body_len as usize
+    }
+
+    fn into_header(self, fields: ParsedHeaderFields) -> MessageHeader {
+        MessageHeader {
+            endian: self.endian,
+            msg_type: self.msg_type,
+            flags: self.flags,
+            serial: self.serial,
+            body_len: self.body_len,
             destination: fields.destination,
             reply_serial: fields.reply_serial,
             sender: fields.sender,
@@ -228,8 +228,101 @@ pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option
             member: fields.member,
             path: fields.path,
             signature: fields.signature,
-        },
+            unix_fds: fields.unix_fds,
+        }
+    }
+}
+
+/// Read one message from a plain byte stream. Used where no descriptors can
+/// arrive (the auth/Hello handshake); `read_message_from` is the fd-aware
+/// counterpart used for the forwarding path.
+pub async fn read_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Option<Message>> {
+    let mut head = [0u8; MIN_HEADER_SIZE];
+    // EOF exactly here means the peer closed between messages - not an error.
+    match stream.read_exact(&mut head[..FIXED_HEADER_SIZE]).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    stream.read_exact(&mut head[FIXED_HEADER_SIZE..]).await?;
+
+    let prologue = Prologue::parse(&head)?;
+
+    let mut fields_buf = vec![0u8; prologue.array_len];
+    stream.read_exact(&mut fields_buf).await?;
+
+    let mut padding_buf = vec![0u8; prologue.padding()];
+    if !padding_buf.is_empty() {
+        stream.read_exact(&mut padding_buf).await?;
+    }
+
+    let mut body = vec![0u8; prologue.body_len as usize];
+    if !body.is_empty() {
+        stream.read_exact(&mut body).await?;
+    }
+
+    let fields = parse_header_fields(&fields_buf, prologue.endian)?;
+
+    let mut raw = Vec::with_capacity(prologue.total_len());
+    raw.extend_from_slice(&head);
+    raw.extend_from_slice(&fields_buf);
+    raw.extend_from_slice(&padding_buf);
+    raw.extend_from_slice(&body);
+
+    Ok(Some(Message {
+        header: prologue.into_header(fields),
         raw,
+        fds: Vec::new(),
+    }))
+}
+
+/// Adopt exactly the descriptors the header declared. The count is capped:
+/// a peer claiming more than the daemon limit is refused rather than trusted.
+fn take_declared_fds(reader: &mut DbusReader, declared: Option<u32>) -> Result<Vec<Arc<OwnedFd>>> {
+    let declared = declared.unwrap_or(0) as usize;
+    if declared > socket::MAX_FDS_PER_MESSAGE {
+        return Err(Error::Protocol(format!(
+            "Message declares {} fds, max {}",
+            declared,
+            socket::MAX_FDS_PER_MESSAGE
+        )));
+    }
+    if declared == 0 {
+        return Ok(Vec::new());
+    }
+    reader
+        .take_fds(declared)
+        .map_err(|e| Error::Protocol(e.to_string()))
+}
+
+/// Read one message together with any SCM_RIGHTS descriptors it carries.
+pub async fn read_message_from(reader: &mut DbusReader) -> Result<Option<Message>> {
+    if !reader.fill(MIN_HEADER_SIZE).await? {
+        return Ok(None);
+    }
+
+    let prologue = Prologue::parse(reader.head(MIN_HEADER_SIZE))?;
+    let total = prologue.total_len();
+
+    if !reader.fill(total).await? {
+        return Err(Error::Protocol(
+            "Connection closed in the middle of a message".to_string(),
+        ));
+    }
+
+    let raw = reader.head(total).to_vec();
+    reader.consume(total);
+
+    let fields = parse_header_fields(
+        &raw[MIN_HEADER_SIZE..prologue.header_end()],
+        prologue.endian,
+    )?;
+    let fds = take_declared_fds(reader, fields.unix_fds)?;
+
+    Ok(Some(Message {
+        header: prologue.into_header(fields),
+        raw,
+        fds,
     }))
 }
 
@@ -243,6 +336,7 @@ struct ParsedHeaderFields {
     member: Option<String>,
     path: Option<String>,
     signature: Option<String>,
+    unix_fds: Option<u32>,
 }
 
 /// D-Bus header field as (code, value) tuple - signature a(yv)
@@ -294,6 +388,7 @@ fn parse_header_fields(buf: &[u8], endian: Endian) -> Result<ParsedHeaderFields>
             5 => result.reply_serial = u32::try_from(&value).ok(),
             6 => result.destination = String::try_from(&value).ok(),
             7 => result.sender = String::try_from(&value).ok(),
+            9 => result.unix_fds = u32::try_from(&value).ok(),
             8 => {
                 // SIGNATURE
                 if let Value::Signature(s) = &value {
@@ -351,8 +446,10 @@ mod tests {
                 member: Some("RequestName".to_string()),
                 path: None,
                 signature: None,
+                unix_fds: None,
             },
             raw: vec![],
+            fds: Vec::new(),
         };
         assert!(msg.is_request_name());
 
@@ -371,8 +468,10 @@ mod tests {
                 member: Some("Hello".to_string()),
                 path: None,
                 signature: None,
+                unix_fds: None,
             },
             raw: vec![],
+            fds: Vec::new(),
         };
         assert!(!msg2.is_request_name());
 
@@ -391,8 +490,10 @@ mod tests {
                 member: Some("RequestName".to_string()),
                 path: None,
                 signature: None,
+                unix_fds: None,
             },
             raw: vec![],
+            fds: Vec::new(),
         };
         assert!(!msg3.is_request_name());
     }
